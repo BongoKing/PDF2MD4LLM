@@ -194,6 +194,52 @@ Enrichment is idempotent: the placeholder pattern is replaced with real Markdown
 
 > **Heads up:** enrichment overwrites the existing `.md` (the re-extracted Markdown is character-for-character the same from pymupdf4llm, only the placeholders differ). If you hand-edited a `.md`, copy it aside first.
 
+#### Filtering enrichment to control cost
+
+A 1000-PDF library can produce 30,000+ image placeholders, dominated by textbooks
+and large reports where most "images" are bullets, dividers, page-number ornaments
+or chapter glyphs — not actual figures. At Sonnet 4.6 vision rates that's $150-$700
+of mostly-wasted spend. Three opt-in filters cut that down:
+
+| Flag | Effect |
+|---|---|
+| `--enrich-max-images-per-pdf N` | Skip whole PDFs that exceed N placeholders. Surgical for textbooks. |
+| `--enrich-min-image-pixels W H` | Drop placeholders below `W × H` (parsed from the placeholder's `[W x H]` tag — cheap, no PDF re-extraction). |
+| `--enrich-skip-pdfs FILE` | Plain-text file, one path-substring per line; matching PDFs are skipped. `#` lines are comments. |
+
+`--enrich-dry-run` previews the projected counts and cost **without making any
+Claude calls or re-extracting any PDFs** — recommended every time before paying:
+
+```bash
+# 1. See what unfiltered enrichment would cost (sanity check)
+python pdf2md.py "...\storage" --enrich-figures --enrich-dry-run
+
+# 2. Tune until the numbers look reasonable
+python pdf2md.py "...\storage" --enrich-figures --enrich-dry-run \
+    --enrich-max-images-per-pdf 50 --enrich-min-image-pixels 30 30
+
+# 3. Run for real with the same filters via batches (50% cheaper)
+python pdf2md.py "...\storage" --enrich-figures --fallback batches \
+    --enrich-max-images-per-pdf 50 --enrich-min-image-pixels 30 30
+python pdf2md.py "...\storage" --resume-batch
+```
+
+Example dry-run output on a real Zotero library:
+
+```
+=== Enrich-figures dry run ===
+Candidate PDFs (have placeholders):  1085
+  - skipped by per-PDF cap (>50):       118  (25234 placeholders)
+       1845 placeholders  BD8VC7BZ\Roncalli - Handbook of Sustainable Finance.pdf
+       1713 placeholders  4PDUBKUG\Lehman et al. - Mathematics for Computer Science.pdf
+       1608 placeholders  PDV4R79G\Arndt - Matters Computational.pdf
+Total placeholders found:             34894
+  - in capped PDFs:                   25234
+  - dropped by --enrich-min-image-pixels (>=30x30):    3314
+Would enrich:                          6346  images across 850 PDFs
+Estimated cost (Sonnet 4.6 batches): ~$31.73 - $63.46
+```
+
 ### Options
 
 - `--jobs N` — parallel workers for conversion (default: 1; triage/fallback/enrich stay sequential)
@@ -201,7 +247,11 @@ Enrichment is idempotent: the placeholder pattern is replaced with real Markdown
 - `--ocr-dpi N` — OCR rasterization DPI (default: 150)
 - `--ocr-lang LANG` — Tesseract language (default: `eng`; e.g. `eng+deu`)
 - `--min-chars-per-page N` — threshold for "minimal output" (default: 100)
-- `--enrich-figures` — transcribe embedded images via Claude (requires `--fallback`)
+- `--enrich-figures` — transcribe embedded images via Claude (requires `--fallback` or `--enrich-dry-run`)
+- `--enrich-max-images-per-pdf N` — skip PDFs with more than N placeholders (default: 0 = no cap)
+- `--enrich-min-image-pixels W H` — drop placeholders smaller than W x H (default: `0 0` = no filter)
+- `--enrich-skip-pdfs FILE` — plain-text file of path-substrings to skip
+- `--enrich-dry-run` — count projected enrichment + cost, no API calls
 - `--api-model MODEL` — model for `--fallback api` / `batches` (default: **`claude-sonnet-4-6`**)
 - `--cli-model MODEL` — model for `--fallback claude-cli` / `command` (default: **`claude-sonnet-4-6`**)
 - `--claude-bin PATH` — explicit path to `claude.exe` / `claude.cmd` (default: auto-detect)

@@ -12,6 +12,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import random
 import re
 import shlex
 import shutil
@@ -73,8 +74,28 @@ PLACEHOLDER_RE = re.compile(
     r"\*\*==>\s*picture\s*\[[^\]]*\]\s*intentionally omitted\s*<==\*\*"
 )
 
+# Same placeholder, but capturing W and H as integers — used by the
+# filtering layer to estimate cost and drop tiny decorative images
+# without re-extracting the PDF.
+PLACEHOLDER_DIMS_RE = re.compile(
+    r"\*\*==>\s*picture\s*\[\s*(\d+)\s*x\s*(\d+)\s*\]\s*"
+    r"intentionally omitted\s*<==\*\*"
+)
+
+
+def _placeholder_dims(md_text: str) -> list[tuple[int, int]]:
+    """Pull every (W, H) tuple from placeholders in a .md, in document order."""
+    return [(int(w), int(h)) for w, h in PLACEHOLDER_DIMS_RE.findall(md_text)]
+
+
 # Markdown image ref produced by pymupdf4llm when write_images=True.
 IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+\.(?:png|jpg|jpeg))\)", re.IGNORECASE)
+_FILENAME_SAFE_RE = re.compile(r"[^\w.\- ]")
+
+# Rough Sonnet 4.6 vision cost range per image, batches discount applied.
+# Used only by --enrich-dry-run to print a price estimate; tune in one place.
+_COST_PER_IMAGE_LOW = 0.005
+_COST_PER_IMAGE_HIGH = 0.01
 
 IMAGE_DESCRIBE_PROMPT = (
     "You are viewing an image extracted from a scientific PDF. "
@@ -555,21 +576,37 @@ def _enrich_image_api(image_path: Path, model: str) -> str:
 
 
 def _enrich_image_cli(image_path: Path, model: str, claude_bin: str) -> str:
-    prompt = f'Read the image at "{image_path}" and perform this task: {IMAGE_DESCRIBE_PROMPT}'
-    argv = [
-        claude_bin, "--model", model,
-        "--permission-mode", "acceptEdits",
-        "--allowedTools", "Read",
-        "-p", prompt,
-    ]
-    result = subprocess.run(
-        argv, capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip() or "<no output>"
-        raise RuntimeError(f"claude -p failed (exit {result.returncode}): {detail}")
-    return (result.stdout or "").strip()
+    # The Read tool cannot resolve filenames containing apostrophes or other
+    # shell-hostile characters (e.g. curly apostrophe from a PDF title like
+    # "China's …"). Copy to a safe temp name when needed so Claude can read it.
+    safe_path: Path | None = None
+    work_path = image_path
+    if _FILENAME_SAFE_RE.search(image_path.name):
+        safe_name = _FILENAME_SAFE_RE.sub("_", image_path.name)
+        safe_path = image_path.parent / safe_name
+        shutil.copy2(image_path, safe_path)
+        work_path = safe_path
+
+    try:
+        prompt = f'Read the image at "{work_path}" and perform this task: {IMAGE_DESCRIBE_PROMPT}'
+        argv = [
+            claude_bin, "--model", model,
+            "--permission-mode", "acceptEdits",
+            "--allowedTools", "Read",
+            "--add-dir", str(work_path.parent),
+            "-p", prompt,
+        ]
+        result = subprocess.run(
+            argv, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip() or "<no output>"
+            raise RuntimeError(f"claude -p failed (exit {result.returncode}): {detail}")
+        return (result.stdout or "").strip()
+    finally:
+        if safe_path is not None:
+            safe_path.unlink(missing_ok=True)
 
 
 def _build_image_cli_command(image_path: Path, model: str,
@@ -577,7 +614,15 @@ def _build_image_cli_command(image_path: Path, model: str,
     prompt = f'Read the image at "{image_path}" and perform this task: {IMAGE_DESCRIBE_PROMPT}'
     return (f"{_quote_for_shell(claude_bin)} --model {model} "
             f"--permission-mode acceptEdits --allowedTools Read "
+            f"--add-dir {_quote_for_shell(str(image_path.parent))} "
             f"-p {_quote_for_shell(prompt)}")
+
+
+def _matches_skip_list(pdf_path: Path, skip_substrings: list) -> bool:
+    if not skip_substrings:
+        return False
+    s = str(pdf_path)
+    return any(needle and needle in s for needle in skip_substrings)
 
 
 def enrich_figures_for_pdf(
@@ -591,20 +636,39 @@ def enrich_figures_for_pdf(
     command_sink,
     batch_state: dict,
     image_root: Path,
-) -> tuple[int, int]:
+    filters: dict,
+) -> tuple[int, int, int, str | None]:
     """Enrich a single PDF's .md by transcribing every embedded image.
 
-    Returns (images_processed, images_failed). images_processed counts images
-    queued (for batches/command) or successfully substituted (api/claude-cli).
+    Returns (images_processed, images_failed, images_dropped_size, skip_reason).
+    skip_reason is one of None, "skip-list", "cap-exceeded".
     """
     if not md_path.exists():
-        return 0, 0
+        return 0, 0, 0, None
     original_md = md_path.read_text(encoding="utf-8", errors="ignore")
-    if not PLACEHOLDER_RE.search(original_md):
-        return 0, 0
+    dims = _placeholder_dims(original_md)
+    if not dims:
+        return 0, 0, 0, None
 
-    # For modes that need images to persist beyond this function (command,
-    # batches: because we encode to base64, tmp is fine), pick appropriate dir.
+    # ---- Filter pass: cheap, no PDF re-extraction needed ----
+    if _matches_skip_list(pdf_path, filters.get("skip_substrings") or []):
+        return 0, 0, 0, "skip-list"
+
+    cap = filters.get("max_per_pdf") or 0
+    if cap > 0 and len(dims) > cap:
+        return 0, 0, 0, "cap-exceeded"
+
+    min_w = filters.get("min_w") or 0
+    min_h = filters.get("min_h") or 0
+    survivor_indices = [
+        i for i, (w, h) in enumerate(dims)
+        if w >= min_w and h >= min_h
+    ]
+    dropped = len(dims) - len(survivor_indices)
+    if not survivor_indices:
+        return 0, 0, dropped, None
+
+    # ---- Now re-extract; only spend time on PDFs that have surviving work ----
     need_persistent = (mode == "command")
     if need_persistent:
         pdf_hash = hashlib.md5(str(pdf_path.resolve()).encode("utf-8")).hexdigest()[:10]
@@ -625,16 +689,32 @@ def enrich_figures_for_pdf(
         )
         refs = list(IMAGE_REF_RE.finditer(md_with_refs))
         if not refs:
-            return 0, 0
+            return 0, 0, dropped, None
+
+        # Sanity check: pymupdf4llm is deterministic, so the number of refs
+        # in the re-extract should equal the number of placeholders we found.
+        # If they diverge, abort filtering for this PDF rather than risk
+        # processing the wrong images.
+        if len(refs) != len(dims):
+            print(f"      WARN: ref count mismatch for {pdf_path.name} "
+                  f"(placeholders={len(dims)}, refs={len(refs)}). "
+                  f"Processing all refs without size filter.")
+            chosen = list(range(len(refs)))
+            dropped = 0
+        else:
+            chosen = survivor_indices
 
         if mode in ("api", "claude-cli"):
             processed = failed = 0
             new_md = md_with_refs
-            for m in refs:
+            total_imgs = len(chosen)
+            for idx, ref_idx in enumerate(chosen, 1):
+                m = refs[ref_idx]
                 ref = m.group(0)
                 img_path = Path(m.group(1))
                 if not img_path.is_absolute():
                     img_path = (img_dir / img_path.name).resolve()
+                t0 = time.time()
                 try:
                     if mode == "api":
                         replacement = _enrich_image_api(img_path, api_model)
@@ -642,21 +722,24 @@ def enrich_figures_for_pdf(
                         replacement = _enrich_image_cli(img_path, cli_model, claude_bin)
                     new_md = new_md.replace(ref, replacement, 1)
                     processed += 1
+                    print(f"      [img {idx}/{total_imgs}] {img_path.name} done "
+                          f"({_fmt_duration(time.time() - t0)})")
                 except Exception as e:
-                    print(f"      enrich error on {img_path.name}: {e}")
+                    print(f"      [img {idx}/{total_imgs}] enrich error on {img_path.name}: {e}")
                     failed += 1
             md_path.write_text(new_md, encoding="utf-8")
-            return processed, failed
+            return processed, failed, dropped, None
 
         if mode == "batches":
             md_path.write_text(md_with_refs, encoding="utf-8")
             queued = 0
-            for idx, m in enumerate(refs):
+            for ref_idx in chosen:
+                m = refs[ref_idx]
                 ref = m.group(0)
                 img_path = Path(m.group(1))
                 if not img_path.is_absolute():
                     img_path = (img_dir / img_path.name).resolve()
-                cid = _custom_id_for_image(pdf_path, ref, idx)
+                cid = _custom_id_for_image(pdf_path, ref, ref_idx)
                 batch_state["requests"].append({
                     "custom_id": cid,
                     "params": {
@@ -671,26 +754,253 @@ def enrich_figures_for_pdf(
                     "image_ref": ref,
                 }
                 queued += 1
-            return queued, 0
+            return queued, 0, dropped, None
 
         if mode == "command":
             md_path.write_text(md_with_refs, encoding="utf-8")
             queued = 0
-            for m in refs:
+            for ref_idx in chosen:
+                m = refs[ref_idx]
                 img_path = Path(m.group(1))
                 if not img_path.is_absolute():
                     img_path = (img_dir / img_path.name).resolve()
+                if _FILENAME_SAFE_RE.search(img_path.name):
+                    safe_name = _FILENAME_SAFE_RE.sub("_", img_path.name)
+                    safe_path = img_path.parent / safe_name
+                    if not safe_path.exists():
+                        shutil.copy2(img_path, safe_path)
+                    img_path = safe_path
                 cmd = _build_image_cli_command(img_path, cli_model)
                 print(f"    CMD: {cmd}")
                 if command_sink is not None:
                     command_sink.write(cmd + "\n")
                 queued += 1
-            return queued, 0
+            return queued, 0, dropped, None
 
         raise ValueError(f"Unknown enrich mode: {mode}")
     finally:
         if cleanup:
             shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def _sample_runtime_estimate(
+    survivors: list,
+    mode: str,
+    api_model: str,
+    cli_model: str,
+    claude_bin: str,
+    ocr_kwargs: dict,
+    sample_size: int = 5,
+) -> tuple[float, float] | None:
+    """Sample N PDFs, time their re-extraction + one image call each, then
+    extrapolate to the whole survivor set.
+
+    `survivors` is a list of (pdf_path, md_path, survivor_indices) tuples.
+    Returns (low_seconds, high_seconds) for the whole run, or None if the
+    sample produced no usable timings.
+
+    NOTE: this makes real Claude calls. Used only when --enrich-dry-run is
+    paired with a synchronous transport (claude-cli / api).
+    """
+    eligible = [s for s in survivors if s[2]]
+    if not eligible:
+        return None
+    n = min(sample_size, len(eligible))
+    sample = random.sample(eligible, n)
+
+    extract_times: list[float] = []
+    image_times: list[float] = []
+
+    print(f"\nSampling per-image timing: {n} PDF(s), 1 image each "
+          f"(real Claude calls via --fallback {mode})...")
+
+    for i, (pdf_path, _md_path, surv_idx) in enumerate(sample, 1):
+        print(f"  [{i}/{n}] {pdf_path.name}", flush=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="pdf2md_dryimgs_") as tmp_str:
+                tmp = Path(tmp_str)
+                t0 = time.time()
+                try:
+                    md_text = pymupdf4llm.to_markdown(
+                        str(pdf_path), write_images=True,
+                        image_path=str(tmp), image_format="png",
+                        **ocr_kwargs,
+                    )
+                except Exception as e:
+                    print(f"      re-extract failed: {e}")
+                    continue
+                extract_dt = time.time() - t0
+                extract_times.append(extract_dt)
+                print(f"      re-extract: {_fmt_duration(extract_dt)}")
+
+                refs = list(IMAGE_REF_RE.finditer(md_text))
+                valid_idxs = [j for j in surv_idx if j < len(refs)]
+                if not valid_idxs:
+                    continue
+                ref_idx = random.choice(valid_idxs)
+                img_path = Path(refs[ref_idx].group(1))
+                if not img_path.is_absolute():
+                    img_path = (tmp / img_path.name).resolve()
+                if not img_path.exists():
+                    continue
+
+                t0 = time.time()
+                try:
+                    if mode == "claude-cli":
+                        _enrich_image_cli(img_path, cli_model, claude_bin)
+                    elif mode == "api":
+                        _enrich_image_api(img_path, api_model)
+                    else:
+                        return None
+                    img_dt = time.time() - t0
+                    image_times.append(img_dt)
+                    print(f"      image call: {_fmt_duration(img_dt)}")
+                except Exception as e:
+                    print(f"      image call failed: {e}")
+        except Exception as e:
+            print(f"      sample error: {e}")
+
+    if not extract_times or not image_times:
+        return None
+
+    total_pdfs = sum(1 for s in survivors if s[2])
+    total_images = sum(len(s[2]) for s in survivors)
+
+    extract_lo = min(extract_times)
+    extract_hi = max(extract_times)
+    image_lo = min(image_times)
+    image_hi = max(image_times)
+
+    # If we only got one sample, give a ±20% margin instead of a flat range.
+    if len(extract_times) == 1:
+        extract_lo *= 0.8
+        extract_hi *= 1.2
+    if len(image_times) == 1:
+        image_lo *= 0.8
+        image_hi *= 1.2
+
+    low_total = total_pdfs * extract_lo + total_images * image_lo
+    high_total = total_pdfs * extract_hi + total_images * image_hi
+    return (low_total, high_total)
+
+
+def enrich_figures_dry_run(
+    pdf_files: list,
+    root: Path,
+    filters: dict,
+    mode: str = "none",
+    api_model: str = "",
+    cli_model: str = "",
+    claude_bin: str = "claude",
+    ocr_kwargs: dict | None = None,
+) -> None:
+    """Iterate the library counting what enrichment WOULD do. Reads existing
+    .md files only (no PDF re-extraction) for the cost report. If `mode` is
+    'claude-cli' or 'api', additionally samples 5 PDFs to estimate runtime."""
+    if ocr_kwargs is None:
+        ocr_kwargs = {}
+    skip_subs = filters.get("skip_substrings") or []
+    cap = filters.get("max_per_pdf") or 0
+    min_w = filters.get("min_w") or 0
+    min_h = filters.get("min_h") or 0
+
+    candidate_pdfs = 0
+    skipped_skiplist: list[tuple[Path, int]] = []
+    skipped_cap: list[tuple[Path, int]] = []
+    total_placeholders = 0
+    images_in_skip_pdfs = 0
+    images_in_cap_pdfs = 0
+    images_dropped_size = 0
+    images_to_enrich = 0
+    pdfs_to_enrich = 0
+
+    # Per-PDF survivor data, kept around for the timing-sample step.
+    survivors: list[tuple[Path, Path, list[int]]] = []
+
+    for pdf_path in pdf_files:
+        md_path = pdf_path.with_suffix(".md")
+        if not md_path.exists():
+            continue
+        try:
+            md = md_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        dims = _placeholder_dims(md)
+        if not dims:
+            continue
+        candidate_pdfs += 1
+        total_placeholders += len(dims)
+
+        if _matches_skip_list(pdf_path, skip_subs):
+            skipped_skiplist.append((pdf_path, len(dims)))
+            images_in_skip_pdfs += len(dims)
+            continue
+
+        if cap > 0 and len(dims) > cap:
+            skipped_cap.append((pdf_path, len(dims)))
+            images_in_cap_pdfs += len(dims)
+            continue
+
+        survivor_idx = [i for i, (w, h) in enumerate(dims)
+                        if w >= min_w and h >= min_h]
+        images_dropped_size += len(dims) - len(survivor_idx)
+        images_to_enrich += len(survivor_idx)
+        if survivor_idx:
+            pdfs_to_enrich += 1
+            survivors.append((pdf_path, md_path, survivor_idx))
+
+    print()
+    print("=== Enrich-figures dry run ===")
+    print(f"Candidate PDFs (have placeholders):  {candidate_pdfs}")
+    if skipped_skiplist:
+        print(f"  - skipped by --enrich-skip-pdfs:    {len(skipped_skiplist):>6}  "
+              f"({images_in_skip_pdfs} placeholders)")
+    if skipped_cap:
+        print(f"  - skipped by per-PDF cap (>{cap}):    {len(skipped_cap):>6}  "
+              f"({images_in_cap_pdfs} placeholders)")
+        worst = sorted(skipped_cap, key=lambda x: -x[1])[:5]
+        for p, n in worst:
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                rel = p
+            print(f"      {n:>5} placeholders  {rel}")
+    print(f"Total placeholders found:           {total_placeholders:>7}")
+    if images_in_skip_pdfs:
+        print(f"  - in skip-list PDFs:              {images_in_skip_pdfs:>7}")
+    if images_in_cap_pdfs:
+        print(f"  - in capped PDFs:                 {images_in_cap_pdfs:>7}")
+    if images_dropped_size:
+        print(f"  - dropped by --enrich-min-image-pixels (>={min_w}x{min_h}): "
+              f"{images_dropped_size:>7}")
+    print(f"Would enrich:                       {images_to_enrich:>7}  images "
+          f"across {pdfs_to_enrich} PDFs")
+
+    low = images_to_enrich * _COST_PER_IMAGE_LOW
+    high = images_to_enrich * _COST_PER_IMAGE_HIGH
+    print(f"Estimated cost: ~${low:,.2f} - ${high:,.2f}  (Sonnet 4.6 vision via batches)")
+
+    # ---------- runtime estimate ----------
+    if images_to_enrich == 0:
+        return
+    if mode in ("claude-cli", "api"):
+        estimate = _sample_runtime_estimate(
+            survivors, mode, api_model, cli_model, claude_bin, ocr_kwargs,
+        )
+        if estimate:
+            low_s, high_s = estimate
+            transport = "claude-cli" if mode == "claude-cli" else "API"
+            print(f"Estimated time: ~{_fmt_duration(low_s)} - {_fmt_duration(high_s)}  "
+                  f"(Sonnet 4.6 vision via {transport}; from a 5-PDF sample)")
+        else:
+            print("Estimated time: unavailable (sample produced no usable timings).")
+    elif mode == "batches":
+        print("Estimated time: ~1h - 24h  (Anthropic Message Batches API; "
+              "typically completes within an hour, server-side parallel)")
+    elif mode == "command":
+        print("Estimated time: depends on when you run the emitted commands.")
+    else:
+        print("Estimated time: pass --fallback {claude-cli|api|batches} to get a runtime estimate.")
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +1112,23 @@ def main():
     parser.add_argument("--enrich-figures", action="store_true",
                         help="Transcribe embedded images (tables/formulas/charts) via Claude; "
                              "requires --fallback to choose a transport")
+    parser.add_argument("--enrich-max-images-per-pdf", type=int, default=0,
+                        metavar="N",
+                        help="Skip PDFs with more than N image placeholders "
+                             "(0 = no cap, default). Useful for skipping textbooks/reports "
+                             "with hundreds of decorative images.")
+    parser.add_argument("--enrich-min-image-pixels", nargs=2, type=int,
+                        default=[0, 0], metavar=("W", "H"),
+                        help="Drop image placeholders smaller than W x H "
+                             "(default: 0 0 = no filter). E.g. '30 30' drops "
+                             "bullets/icons/separators.")
+    parser.add_argument("--enrich-skip-pdfs", default=None, metavar="FILE",
+                        help="Plain-text file of substrings (one per line). "
+                             "PDFs whose path matches any line are skipped entirely. "
+                             "Lines starting with '#' are comments.")
+    parser.add_argument("--enrich-dry-run", action="store_true",
+                        help="Iterate the library, print projected counts and a cost "
+                             "estimate, then exit. No re-extraction, no Claude calls.")
 
     # Fallback
     parser.add_argument("--fallback",
@@ -857,8 +1184,12 @@ def main():
                   "(only required if you use --fallback api or batches)")
         return
 
-    if args.enrich_figures and args.fallback == "none":
-        print("Error: --enrich-figures requires --fallback (api | claude-cli | batches | command).")
+    if args.enrich_dry_run and not args.enrich_figures:
+        print("Error: --enrich-dry-run requires --enrich-figures.")
+        sys.exit(1)
+    if args.enrich_figures and args.fallback == "none" and not args.enrich_dry_run:
+        print("Error: --enrich-figures requires --fallback (api | claude-cli | batches | command), "
+              "or pair with --enrich-dry-run for an estimate-only run.")
         sys.exit(1)
 
     root = Path(args.root_dir) if args.root_dir else None
@@ -869,6 +1200,25 @@ def main():
     if args.resume_batch:
         resume_batch(root)
         return
+
+    # Build enrichment filters once; reused by dry-run and the real pass.
+    enrich_filters = {
+        "max_per_pdf": args.enrich_max_images_per_pdf,
+        "min_w": args.enrich_min_image_pixels[0],
+        "min_h": args.enrich_min_image_pixels[1],
+        "skip_substrings": [],
+    }
+    if args.enrich_skip_pdfs:
+        skip_path = Path(args.enrich_skip_pdfs)
+        if not skip_path.is_file():
+            print(f"Error: --enrich-skip-pdfs file not found: {skip_path}")
+            sys.exit(1)
+        enrich_filters["skip_substrings"] = [
+            line.strip() for line in skip_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        print(f"Loaded {len(enrich_filters['skip_substrings'])} skip-list entries "
+              f"from {skip_path}")
 
     # Tesseract preflight (unless OCR is disabled)
     if args.ocr != "never":
@@ -887,10 +1237,24 @@ def main():
     if not pdf_files:
         return
 
-    # Preflight claude CLI if needed (fallback claude-cli or enrich via CLI)
+    # Preflight claude CLI if needed — for the regular --fallback claude-cli
+    # path AND for --enrich-dry-run with --fallback claude-cli (timing sample).
     claude_bin = args.claude_bin
     if args.fallback == "claude-cli":
         claude_bin = preflight_claude_cli(claude_bin)
+
+    # Dry-run short-circuit. Now after preflights so the timing sample has a
+    # working transport.
+    if args.enrich_dry_run:
+        enrich_figures_dry_run(
+            pdf_files, root, enrich_filters,
+            mode=args.fallback,
+            api_model=args.api_model,
+            cli_model=args.cli_model,
+            claude_bin=claude_bin or "claude",
+            ocr_kwargs=ocr_kwargs,
+        )
+        return
 
     command_sink = None
     if args.fallback == "command":
@@ -904,6 +1268,7 @@ def main():
 
     success = skipped = failed = flagged = fallback_ok = fallback_fail = 0
     enrich_mds = enrich_imgs = enrich_fail = 0
+    enrich_pdfs_skipped = enrich_imgs_dropped = 0
     flagged_report = []
     convert_failures: set[str] = set()  # pdf_path strs that failed convert
 
@@ -991,18 +1356,26 @@ def main():
                 # Figure enrichment
                 if args.enrich_figures and md_path.exists():
                     try:
-                        processed, failed_imgs = enrich_figures_for_pdf(
+                        processed, failed_imgs, dropped, skip_reason = enrich_figures_for_pdf(
                             pdf_path, md_path, args.fallback,
                             args.api_model, args.cli_model,
                             claude_bin or "claude",
                             ocr_kwargs, command_sink, batch_state, image_root,
+                            enrich_filters,
                         )
-                        if processed or failed_imgs:
+                        if skip_reason:
+                            enrich_pdfs_skipped += 1
+                            print(f"{tag} SKIP-ENRICH ({skip_reason}): {pdf_path.name}")
+                        elif processed or failed_imgs:
                             enrich_mds += 1
                             enrich_imgs += processed
                             enrich_fail += failed_imgs
+                            enrich_imgs_dropped += dropped
+                            extra = f", dropped: {dropped}" if dropped else ""
                             print(f"{tag} ENRICHED: {pdf_path.name} "
-                                  f"(images: {processed}, failed: {failed_imgs})")
+                                  f"(images: {processed}, failed: {failed_imgs}{extra})")
+                        elif dropped:
+                            enrich_imgs_dropped += dropped
                     except Exception as e:
                         print(f"    ENRICH ERROR on {pdf_path.name}: {e}")
                         enrich_fail += 1
@@ -1021,8 +1394,13 @@ def main():
         if args.fallback not in ("none", "batches"):
             print(f"Fallback        -> ok: {fallback_ok}, failed: {fallback_fail}")
     if args.enrich_figures:
-        print(f"Enrich-figures  -> enriched MDs: {enrich_mds}, "
-              f"images processed: {enrich_imgs}, failed: {enrich_fail}")
+        line = (f"Enrich-figures  -> enriched MDs: {enrich_mds}, "
+                f"images processed: {enrich_imgs}, failed: {enrich_fail}")
+        if enrich_pdfs_skipped:
+            line += f", pdfs-skipped: {enrich_pdfs_skipped}"
+        if enrich_imgs_dropped:
+            line += f", images-dropped (size): {enrich_imgs_dropped}"
+        print(line)
 
     if flagged_report:
         print("\nAll observations:")
