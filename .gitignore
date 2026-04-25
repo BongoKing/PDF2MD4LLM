@@ -1,0 +1,32 @@
+# PDF storage (user data, not part of the repo) & local python cmd
+storage/
+local_python_cmd.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code internals
+.claude/
+
+

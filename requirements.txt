@@ -1,0 +1,3 @@
+pymupdf4llm>=0.0.17
+# Optional: only needed for --fallback api (default model: claude-sonnet-4-6)
+anthropic>=0.40.0
