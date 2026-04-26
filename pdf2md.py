@@ -1,9 +1,19 @@
-"""Convert all PDFs in a directory tree to Markdown files using pymupdf4llm.
+"""Convert PDFs in a directory tree to LLM-friendly Markdown.
 
-Triage + optional Claude fallback cover PDFs that pymupdf4llm can't handle
-(broken text extraction, math fonts dropped). A separate --enrich-figures
-pass re-extracts images and sends each one to Claude for transcription
-(rasterized tables / formulas / charts embedded as pictures).
+Two-stage pipeline:
+
+  1. Local extraction with pymupdf4llm (text, tables, OCR for scanned pages).
+  2. Optional Claude pass for content pymupdf4llm cannot recover:
+        - Whole-PDF fallback for documents triage flagged as broken.
+        - Figure enrichment that transcribes embedded raster images
+          (tables, formulas, charts) and splices the result back into
+          the existing .md.
+
+The figure-enrichment step is durable: any per-image failure
+restores the original placeholder rather than leaving a dead
+markdown image ref in the .md, so a subsequent run can retry
+cleanly. Quota and rate-limit errors trigger an automatic
+sleep-until-reset and resume.
 """
 
 import argparse
@@ -20,20 +30,20 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pymupdf
 import pymupdf4llm
 
 
-# ---------------------------------------------------------------------------
-# Triage heuristics
-# ---------------------------------------------------------------------------
+# === Constants & regexes ===
+# Placeholder text, image-ref grammar, and prompts used throughout the file.
 
-# Fonts that are *specifically* mathematical typesetting.
+# Math fonts that genuinely indicate mathematical typesetting.
 # DO NOT include generic Symbol / SymbolMT / SegoeUISymbol — those are used
-# for bullets, arrows and checkmarks in ordinary text PDFs and cause massive
-# false positives.
+# for bullets, arrows and checkmarks in ordinary text PDFs and produce
+# heavy false positives.
 MATH_FONT_MARKERS = (
     "CMMI", "CMSY", "CMEX", "CMBSY", "CMMIB",        # TeX Computer Modern math
     "MSAM", "MSBM",                                   # AMS math symbols
@@ -45,11 +55,11 @@ MATH_FONT_MARKERS = (
     "TeX_CM_Maths",                                   # TeX encoded
 )
 
-# If the extracted MD already contains plausible math markup, don't flag
-# math fonts — pymupdf4llm did capture something.
+# If the .md already contains plausible math markup, treat math fonts as
+# captured rather than dropped.
 LATEX_MARKERS = re.compile(
-    r"(\$[^$\n]{2,}\$)|"                              # inline $...$
-    r"(\$\$[\s\S]+?\$\$)|"                            # display $$...$$
+    r"(\$[^$\n]{2,}\$)|"
+    r"(\$\$[\s\S]+?\$\$)|"
     r"(\\(frac|sum|int|sqrt|alpha|beta|gamma|delta|"
     r"theta|lambda|mu|sigma|pi|infty|partial|nabla|"
     r"cdot|times|leq|geq|approx|neq|rightarrow|le|ge))",
@@ -67,33 +77,40 @@ DEFAULT_FALLBACK_PROMPT = (
     "Output ONLY the Markdown content, no preamble, no code fences around the whole output."
 )
 
-# Placeholder emitted by pymupdf4llm when an image is NOT being written out
-# (default behavior with write_images=False). Example:
-#   **==> picture [61 x 67] intentionally omitted <==**
+# Placeholder pymupdf4llm emits for each embedded image when write_images=False.
+# Example: **==> picture [61 x 67] intentionally omitted <==**
 PLACEHOLDER_RE = re.compile(
     r"\*\*==>\s*picture\s*\[[^\]]*\]\s*intentionally omitted\s*<==\*\*"
 )
 
-# Same placeholder, but capturing W and H as integers — used by the
-# filtering layer to estimate cost and drop tiny decorative images
-# without re-extracting the PDF.
+# Same placeholder, but capturing W and H — used by the cost / size filter.
+# Note: deliberately does NOT match [unknown] placeholders produced by the
+# recovery pass (their dims are lost), so those bypass the size filter.
 PLACEHOLDER_DIMS_RE = re.compile(
     r"\*\*==>\s*picture\s*\[\s*(\d+)\s*x\s*(\d+)\s*\]\s*"
     r"intentionally omitted\s*<==\*\*"
 )
 
-
-def _placeholder_dims(md_text: str) -> list[tuple[int, int]]:
-    """Pull every (W, H) tuple from placeholders in a .md, in document order."""
-    return [(int(w), int(h)) for w, h in PLACEHOLDER_DIMS_RE.findall(md_text)]
-
-
-# Markdown image ref produced by pymupdf4llm when write_images=True.
+# Markdown image ref produced by pymupdf4llm when write_images=True, plus
+# any sentinel refs we write ourselves (batches / command mode).
 IMAGE_REF_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+\.(?:png|jpg|jpeg))\)", re.IGNORECASE)
 _FILENAME_SAFE_RE = re.compile(r"[^\w.\- ]")
 
 # Rough Sonnet 4.6 vision cost range per image, batches discount applied.
 # Used only by --enrich-dry-run to print a price estimate; tune in one place.
+_COST_PER_IMAGE_LOW = 0.005
+_COST_PER_IMAGE_HIGH = 0.01
+
+# Pending sentinel format used by batches / command mode to mark a slot
+# that will be resolved later. Kept as a valid IMAGE_REF so existing
+# tooling treats it consistently; the recovery pass detects it via the
+# pdf2md-pending- filename prefix.
+SENTINEL_PREFIX = "pdf2md-pending-"
+
+_FILENAME_SAFE_RE = re.compile(r"[^\w.\- ]")
+
+# Rough Sonnet 4.6 vision cost range per image (batches discount applied).
+# Used only by --enrich-dry-run to print a price estimate.
 _COST_PER_IMAGE_LOW = 0.005
 _COST_PER_IMAGE_HIGH = 0.01
 
@@ -108,12 +125,38 @@ IMAGE_DESCRIBE_PROMPT = (
     "Output ONLY the Markdown replacement. No preamble, no code fence."
 )
 
-BATCH_STATE_FILENAME = "pdf2md_batch.json"
+# Persistent location for kept-image-mode and command-mode image dumps,
+# placed under the library root so relative .md links remain valid when
+# the library is moved.
+IMAGE_ROOT_NAME = "pdf2md_images"
+
+# Project-side state directory layout. Resolved relative to this script
+# unless the user overrides with --state-dir.
+PROJECT_DIR = Path(__file__).resolve().parent
+STATE_DIR_DEFAULT = PROJECT_DIR / "state"
+OUTPUT_DIR_DEFAULT = PROJECT_DIR / "output"
 
 
-# ---------------------------------------------------------------------------
-# Tesseract OCR preflight
-# ---------------------------------------------------------------------------
+def placeholder_dims(md_text: str) -> list[tuple[int, int]]:
+    """Pull every (W, H) tuple from placeholders in a .md, in document order."""
+    return [(int(w), int(h)) for w, h in PLACEHOLDER_DIMS_RE.findall(md_text)]
+
+
+def library_hash(root: Path) -> str:
+    """10-char md5 of the resolved root path. Used to namespace per-library
+    state files so multiple libraries can each have an in-flight batch."""
+    return hashlib.md5(str(root.resolve()).encode("utf-8")).hexdigest()[:10]
+
+
+def batch_state_path(root: Path, state_dir: Path) -> Path:
+    return state_dir / f"pdf2md_batch_{library_hash(root)}.json"
+
+
+def triage_command_path(root: Path, output_dir: Path) -> Path:
+    return output_dir / f"pdf2md_triage_commands_{library_hash(root)}.txt"
+
+
+# === Tesseract OCR preflight ===
 
 TESSERACT_INSTALL_HINT = """
 Tesseract OCR binary not found on PATH.
@@ -133,6 +176,7 @@ Bypass this check with  --ocr never  (not recommended for scanned PDFs).
 
 
 def preflight_tesseract() -> str:
+    """Return the Tesseract path or exit with an install hint."""
     path = shutil.which("tesseract")
     if not path:
         print(TESSERACT_INSTALL_HINT)
@@ -140,14 +184,14 @@ def preflight_tesseract() -> str:
     return path
 
 
-# ---------------------------------------------------------------------------
-# Detection / triage
-# ---------------------------------------------------------------------------
+# === Triage ===
+# Detect PDFs whose pymupdf4llm output is unusable so the Claude full-PDF
+# fallback is only spent where it adds value.
 
 def analyze_pdf(pdf_path: Path) -> dict:
-    """Inspect a PDF for math-font presence only — pymupdf4llm itself handles
-    the scanned / image-per-page case via OCR."""
-    info = {"pages": 0, "math_fonts": set(), "error": None}
+    """Inspect a PDF for math-font presence. pymupdf4llm itself handles
+    scanned / image-only documents via OCR."""
+    info: dict = {"pages": 0, "math_fonts": set(), "error": None}
     try:
         with pymupdf.open(str(pdf_path)) as doc:
             info["pages"] = doc.page_count
@@ -158,8 +202,8 @@ def analyze_pdf(pdf_path: Path) -> dict:
                         if marker.lower() in basefont.lower():
                             info["math_fonts"].add(basefont)
                             break
-    except Exception as e:
-        info["error"] = str(e)
+    except Exception as exc:
+        info["error"] = str(exc)
     return info
 
 
@@ -170,22 +214,21 @@ def md_has_math_markup(md_text: str) -> bool:
     return unicode_math > 5
 
 
-def triage(pdf_path: Path, md_path: Path, min_chars_per_page: int) -> tuple:
-    """
-    Return (reasons, should_fallback).
+def triage(pdf_path: Path, md_path: Path,
+           min_chars_per_page: int) -> tuple[list[str], bool]:
+    """Return (reasons, should_fallback).
 
     Hard triggers (should_fallback=True):
       - md-empty / md-missing / md-minimal
       - math-fonts-dropped
 
-    Informational only (no fallback):
+    Informational (no fallback):
       - math-fonts-present-but-captured
     """
-    reasons = []
+    reasons: list[str] = []
     should_fallback = False
 
     pdf_info = analyze_pdf(pdf_path)
-
     if pdf_info["error"]:
         reasons.append(f"pdf-read-error: {pdf_info['error']}")
         return reasons, False
@@ -217,9 +260,9 @@ def triage(pdf_path: Path, md_path: Path, min_chars_per_page: int) -> tuple:
     return reasons, should_fallback
 
 
-# ---------------------------------------------------------------------------
-# claude CLI resolution (fixes Windows "not recognized" errors)
-# ---------------------------------------------------------------------------
+# === Claude CLI resolution ===
+# Locate the Claude Code CLI binary across platforms (Windows .cmd / .exe,
+# npm install paths, native installer paths) and verify it responds.
 
 CLAUDE_CLI_INSTALL_HINT = """
 Claude Code CLI not found. NOTE: the 'Claude' desktop app is a different
@@ -244,6 +287,7 @@ of your Claude Max subscription):
 
 
 def resolve_claude_executable(verify: bool = True) -> str:
+    """Find a working `claude` binary, searching PATH and known install dirs."""
     for name in ("claude", "claude.cmd", "claude.exe"):
         path = shutil.which(name)
         if path and (not verify or _verify_claude_binary(path)):
@@ -257,9 +301,9 @@ def resolve_claude_executable(verify: bool = True) -> str:
         Path.home() / ".claude" / "local" / "claude.exe",
         Path.home() / ".claude" / "local" / "claude.cmd",
     ]
-    for c in candidates:
-        if c.exists() and (not verify or _verify_claude_binary(str(c))):
-            return str(c)
+    for candidate in candidates:
+        if candidate.exists() and (not verify or _verify_claude_binary(str(candidate))):
+            return str(candidate)
 
     raise RuntimeError(CLAUDE_CLI_INSTALL_HINT)
 
@@ -277,6 +321,7 @@ def _verify_claude_binary(path: str) -> bool:
 
 
 def preflight_claude_cli(claude_bin: str | None) -> str:
+    """Confirm the CLI is reachable; print version. Exit on failure."""
     if claude_bin:
         if not _verify_claude_binary(claude_bin):
             print(f"Error: --claude-bin {claude_bin!r} did not respond to `--version`.")
@@ -285,8 +330,8 @@ def preflight_claude_cli(claude_bin: str | None) -> str:
         return claude_bin
     try:
         resolved = resolve_claude_executable(verify=True)
-    except RuntimeError as e:
-        print(f"Error: {e}")
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
     try:
         out = subprocess.run(
@@ -294,16 +339,18 @@ def preflight_claude_cli(claude_bin: str | None) -> str:
             capture_output=True, text=True, timeout=10,
             encoding="utf-8", errors="replace",
         )
-        version = (out.stdout or out.stderr).strip().splitlines()[0] if out.stdout or out.stderr else "?"
+        version = (out.stdout or out.stderr).strip().splitlines()[0] \
+            if out.stdout or out.stderr else "?"
     except Exception:
         version = "?"
     print(f"Claude Code CLI OK: {resolved}  ({version})")
     return resolved
 
 
-# ---------------------------------------------------------------------------
-# Full-PDF fallback handlers
-# ---------------------------------------------------------------------------
+# === Full-PDF fallback transports ===
+# Re-process whole PDFs that triage flagged as broken. Four transports:
+# api (sync), claude-cli (Claude Max sub), batches (async/cheaper), command
+# (emit shell commands for later execution).
 
 def _build_api_messages(pdf_path: Path) -> list:
     pdf_b64 = base64.standard_b64encode(pdf_path.read_bytes()).decode("utf-8")
@@ -352,10 +399,10 @@ def _build_cli_prompt(pdf_path: Path, md_path: Path) -> str:
     )
 
 
-def _quote_for_shell(s: str) -> str:
+def _quote_for_shell(text: str) -> str:
     if os.name == "nt":
-        return '"' + s.replace('"', '\\"') + '"'
-    return shlex.quote(s)
+        return '"' + text.replace('"', '\\"') + '"'
+    return shlex.quote(text)
 
 
 def build_claude_cli_command(pdf_path: Path, md_path: Path, model: str,
@@ -367,7 +414,7 @@ def build_claude_cli_command(pdf_path: Path, md_path: Path, model: str,
 
 
 def _claude_cli_argv(pdf_path: Path, md_path: Path, model: str,
-                     claude_bin: str) -> list:
+                     claude_bin: str) -> list[str]:
     prompt = _build_cli_prompt(pdf_path, md_path)
     return [
         claude_bin,
@@ -406,19 +453,19 @@ def fallback_command_only(pdf_path: Path, md_path: Path, model: str, sink) -> No
         sink.write(cmd + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Batches API — full-PDF path
-# ---------------------------------------------------------------------------
+# === Batches API state management ===
+# fallback_batches_collect / submit_batch / resume_batch operate on a small
+# JSON state file under <project>/state/, keyed by library hash.
 
 def _custom_id_for(pdf_path: Path) -> str:
-    h = hashlib.md5(str(pdf_path.resolve()).encode("utf-8")).hexdigest()[:20]
-    return f"pdf_{h}"
+    digest = hashlib.md5(str(pdf_path.resolve()).encode("utf-8")).hexdigest()[:20]
+    return f"pdf_{digest}"
 
 
-def _custom_id_for_image(pdf_path: Path, ref: str, idx: int) -> str:
-    key = f"{pdf_path.resolve()}::{idx}::{ref}"
-    h = hashlib.md5(key.encode("utf-8")).hexdigest()[:20]
-    return f"img_{h}"
+def _custom_id_for_image(pdf_path: Path, ref_index: int) -> str:
+    key = f"{pdf_path.resolve()}::{ref_index}"
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:20]
+    return f"img_{digest}"
 
 
 def fallback_batches_collect(pdf_path: Path, md_path: Path, model: str,
@@ -426,19 +473,19 @@ def fallback_batches_collect(pdf_path: Path, md_path: Path, model: str,
     size_mb = pdf_path.stat().st_size / (1024 * 1024)
     if size_mb > 32:
         raise RuntimeError(f"PDF is {size_mb:.1f} MB, exceeds API 32 MB limit")
-    cid = _custom_id_for(pdf_path)
+    custom_id = _custom_id_for(pdf_path)
     batch_state["requests"].append({
-        "custom_id": cid,
+        "custom_id": custom_id,
         "params": {
             "model": model,
             "max_tokens": 16000,
             "messages": _build_api_messages(pdf_path),
         },
     })
-    batch_state["mapping"][cid] = {"kind": "pdf", "md_path": str(md_path)}
+    batch_state["mapping"][custom_id] = {"kind": "pdf", "md_path": str(md_path)}
 
 
-def submit_batch(batch_state: dict, root: Path) -> None:
+def submit_batch(batch_state: dict, root: Path, state_dir: Path) -> None:
     if not batch_state["requests"]:
         print("No requests to submit.")
         return
@@ -453,9 +500,11 @@ def submit_batch(batch_state: dict, root: Path) -> None:
     state = {
         "batch_id": batch.id,
         "submitted_at": batch.created_at.isoformat() if hasattr(batch.created_at, "isoformat") else str(batch.created_at),
+        "root": str(root.resolve()),
         "mapping": batch_state["mapping"],
     }
-    state_path = root / BATCH_STATE_FILENAME
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = batch_state_path(root, state_dir)
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     print(f"\nBatch submitted: {batch.id}")
@@ -466,8 +515,8 @@ def submit_batch(batch_state: dict, root: Path) -> None:
     print("  Batches typically finish within 1 hour (max 24h, 50% cheaper than sync).")
 
 
-def resume_batch(root: Path) -> None:
-    state_path = root / BATCH_STATE_FILENAME
+def resume_batch(root: Path, state_dir: Path) -> None:
+    state_path = batch_state_path(root, state_dir)
     if not state_path.exists():
         print(f"No batch state file at {state_path}")
         return
@@ -491,7 +540,7 @@ def resume_batch(root: Path) -> None:
         return
 
     ok = failed = 0
-    image_edits: dict[str, list[tuple[str, str]]] = {}  # md_path -> [(ref, replacement), ...]
+    image_edits: dict[str, list[tuple[str, str]]] = {}
 
     for result in client.messages.batches.results(batch_id):
         entry = state["mapping"].get(result.custom_id)
@@ -504,7 +553,7 @@ def resume_batch(root: Path) -> None:
             continue
 
         text = "".join(
-            b.text for b in result.result.message.content if b.type == "text"
+            block.text for block in result.result.message.content if block.type == "text"
         ).strip()
 
         kind = entry.get("kind", "pdf")
@@ -517,7 +566,6 @@ def resume_batch(root: Path) -> None:
             image_edits.setdefault(str(md_path), []).append((entry["image_ref"], text))
             ok += 1
 
-    # Apply per-image edits in bulk per md file
     for md_path_str, edits in image_edits.items():
         md_path = Path(md_path_str)
         if not md_path.exists():
@@ -531,23 +579,209 @@ def resume_batch(root: Path) -> None:
     state_path.rename(state_path.with_name(state_path.name + ".done"))
 
 
-# ---------------------------------------------------------------------------
-# --enrich-figures: per-image transcription
-# ---------------------------------------------------------------------------
+# === Quota & pacing ===
+# Detect rate-limit errors from API and CLI, extract retry-after hints,
+# and sleep-with-cap so an overnight run can resume after a quota window
+# closes without manual intervention.
+
+class QuotaExhaustedError(RuntimeError):
+    """Raised when the run-wide max_wait cap is exceeded.
+
+    The slot-based rebuild restores any unprocessed images to their
+    original placeholders before this propagates, so a re-run picks up
+    cleanly where the run stopped.
+    """
+
+
+_QUOTA_MARKERS = (
+    "rate limit", "rate_limit", "rate-limit",
+    "quota", "usage limit", "usage_limit",
+    "429", "too many requests",
+    "credit balance is too low",
+    "overloaded", "overloaded_error",
+)
+
+
+def is_quota_or_rate_limit(error_text: str) -> bool:
+    """True if the error string looks like a rate-limit / quota / overload."""
+    haystack = (error_text or "").lower()
+    return any(marker in haystack for marker in _QUOTA_MARKERS)
+
+
+# Recognised retry-after hints in stderr / error bodies.
+_RETRY_AFTER_RE = re.compile(
+    r"retry[\s_-]*after[\s:=]+(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_ISO_RESET_RE = re.compile(
+    r"(reset|resets|retry)[^0-9]{0,30}"
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.IGNORECASE,
+)
+
+
+def parse_retry_after(text: str) -> float | None:
+    """Pick a wait-seconds hint out of an error message, or None.
+
+    Recognises:
+      - HTTP-style Retry-After: <seconds>
+      - ISO-8601 reset timestamps embedded in error bodies
+    """
+    if not text:
+        return None
+    match = _RETRY_AFTER_RE.search(text)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    match = _ISO_RESET_RE.search(text)
+    if match:
+        timestamp = match.group(2).rstrip("Z")
+        try:
+            from datetime import datetime, timezone
+            if "+" in timestamp or timestamp[-6] in ("+", "-"):
+                target = datetime.fromisoformat(timestamp)
+            else:
+                target = datetime.fromisoformat(timestamp).replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            delta = (target - now).total_seconds()
+            return max(delta, 0.0)
+        except (ValueError, IndexError):
+            pass
+    return None
+
+
+@dataclass
+class RateLimitSnapshot:
+    """API-mode pacing data harvested from anthropic-ratelimit-* headers."""
+    requests_used_pct: float
+    tokens_used_pct: float
+    requests_reset: str
+    tokens_reset: str
+
+    def max_used_pct(self) -> float:
+        return max(self.requests_used_pct, self.tokens_used_pct)
+
+    def soonest_reset(self) -> str:
+        return self.requests_reset if self.requests_used_pct >= self.tokens_used_pct \
+            else self.tokens_reset
+
+
+def read_rate_limit_headers(headers) -> RateLimitSnapshot | None:
+    """Parse anthropic-ratelimit-* headers into a snapshot, or None if absent."""
+    def get(name: str) -> str | None:
+        try:
+            return headers.get(name)
+        except AttributeError:
+            return headers[name] if name in headers else None
+
+    try:
+        req_limit = float(get("anthropic-ratelimit-requests-limit") or 0)
+        req_remaining = float(get("anthropic-ratelimit-requests-remaining") or 0)
+        tok_limit = float(get("anthropic-ratelimit-tokens-limit") or 0)
+        tok_remaining = float(get("anthropic-ratelimit-tokens-remaining") or 0)
+    except (TypeError, ValueError):
+        return None
+    if req_limit == 0 or tok_limit == 0:
+        return None
+    return RateLimitSnapshot(
+        requests_used_pct=100.0 * (1.0 - req_remaining / req_limit),
+        tokens_used_pct=100.0 * (1.0 - tok_remaining / tok_limit),
+        requests_reset=get("anthropic-ratelimit-requests-reset") or "",
+        tokens_reset=get("anthropic-ratelimit-tokens-reset") or "",
+    )
+
+
+@dataclass
+class RateLimitTracker:
+    """Run-wide pacing state. One instance per --enrich-figures invocation."""
+    max_wait_seconds: float
+    rate_limit_wait_seconds: float
+    sleep_func: callable = field(default=time.sleep)
+    total_slept: float = 0.0
+    last_snapshot: RateLimitSnapshot | None = None
+    previous_snapshot: RateLimitSnapshot | None = None
+
+    def sleep_until_reset(self, wait_seconds: float, reason: str) -> None:
+        """Sleep, accumulating into total_slept. Raises QuotaExhaustedError
+        if the run-wide cap would be exceeded."""
+        wait_seconds = max(wait_seconds, 1.0)
+        if self.total_slept + wait_seconds > self.max_wait_seconds:
+            raise QuotaExhaustedError(
+                f"Run-wide --enrich-max-wait ({_fmt_duration(self.max_wait_seconds)}) "
+                f"would be exceeded by sleeping another {_fmt_duration(wait_seconds)}. "
+                f"Total already slept: {_fmt_duration(self.total_slept)}."
+            )
+        print(f"=== {reason} ===")
+        print(f"   Sleeping {_fmt_duration(wait_seconds)}, then retrying...")
+        self.sleep_func(wait_seconds)
+        self.total_slept += wait_seconds
+        print(f"=== Resuming (total slept this run: "
+              f"{_fmt_duration(self.total_slept)}) ===")
+
+    def remember(self, snapshot: RateLimitSnapshot | None) -> None:
+        if snapshot is None:
+            return
+        self.previous_snapshot = self.last_snapshot
+        self.last_snapshot = snapshot
+
+    def projected_to_cross(self, threshold_pct: float, lookahead_calls: int = 5) -> bool:
+        """True if pace-aware mode predicts the threshold will be crossed within
+        the next `lookahead_calls` API calls based on the slope of usage."""
+        if self.last_snapshot is None or self.previous_snapshot is None:
+            return False
+        slope = (self.last_snapshot.tokens_used_pct
+                 - self.previous_snapshot.tokens_used_pct)
+        if slope <= 0:
+            return False
+        projected = self.last_snapshot.tokens_used_pct + slope * lookahead_calls
+        return projected >= threshold_pct
+
+
+def call_with_retry(func, *args, retries: int = 2, base_delay: float = 2.0,
+                    **kwargs):
+    """Run func with exponential backoff for transient errors.
+
+    Quota / rate-limit errors are NOT retried here; they propagate unchanged
+    so the caller can apply its own slot-restore + sleep-and-retry policy.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if is_quota_or_rate_limit(str(exc)):
+                raise
+            last_exc = exc
+            if attempt >= retries:
+                break
+            time.sleep(base_delay * (2 ** attempt))
+    assert last_exc is not None
+    raise last_exc
+
+
+# === Figure enrichment ===
+# Re-extract a PDF with write_images=True, hand each embedded image to
+# Claude with an image-specific prompt, and splice the response back into
+# the .md. The slot-based rebuild guarantees every slot is either
+# enriched or restored to its original placeholder, so a partial run
+# leaves the .md fully retriable.
 
 def _ocr_kwargs(ocr_mode: str, ocr_dpi: int, ocr_lang: str) -> dict:
     if ocr_mode == "never":
         return {}
-    kw = {"use_ocr": True, "ocr_dpi": ocr_dpi, "ocr_language": ocr_lang}
+    kwargs = {"use_ocr": True, "ocr_dpi": ocr_dpi, "ocr_language": ocr_lang}
     if ocr_mode == "always":
-        kw["force_ocr"] = True
-    return kw
+        kwargs["force_ocr"] = True
+    return kwargs
 
 
 def _build_image_api_messages(image_path: Path) -> list:
     img_b64 = base64.standard_b64encode(image_path.read_bytes()).decode("utf-8")
     ext = image_path.suffix.lower().lstrip(".")
-    media_type = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext, "image/png")
+    media_type = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(
+        ext, "image/png")
     return [{
         "role": "user",
         "content": [
@@ -564,21 +798,30 @@ def _build_image_api_messages(image_path: Path) -> list:
     }]
 
 
-def _enrich_image_api(image_path: Path, model: str) -> str:
+def _enrich_image_api(image_path: Path, model: str
+                      ) -> tuple[str, RateLimitSnapshot | None]:
+    """Return (transcription, rate-limit snapshot). Reads the raw response
+    so anthropic-ratelimit-* headers are available for pacing."""
     import anthropic
     client = anthropic.Anthropic()
-    message = client.messages.create(
+    raw = client.messages.with_raw_response.create(
         model=model,
         max_tokens=4000,
         messages=_build_image_api_messages(image_path),
     )
-    return "".join(b.text for b in message.content if b.type == "text").strip()
+    snapshot = read_rate_limit_headers(raw.headers)
+    message = raw.parse()
+    text = "".join(block.text for block in message.content if block.type == "text").strip()
+    return text, snapshot
 
 
 def _enrich_image_cli(image_path: Path, model: str, claude_bin: str) -> str:
-    # The Read tool cannot resolve filenames containing apostrophes or other
-    # shell-hostile characters (e.g. curly apostrophe from a PDF title like
-    # "China's …"). Copy to a safe temp name when needed so Claude can read it.
+    """Run claude -p on the image. Returns transcription text.
+
+    Copies the image to a shell-safe filename when needed (the Read tool
+    cannot resolve names containing apostrophes or other shell-hostile
+    characters such as a curly apostrophe in a PDF title).
+    """
     safe_path: Path | None = None
     work_path = image_path
     if _FILENAME_SAFE_RE.search(image_path.name):
@@ -621,8 +864,35 @@ def _build_image_cli_command(image_path: Path, model: str,
 def _matches_skip_list(pdf_path: Path, skip_substrings: list) -> bool:
     if not skip_substrings:
         return False
-    s = str(pdf_path)
-    return any(needle and needle in s for needle in skip_substrings)
+    text = str(pdf_path)
+    return any(needle and needle in text for needle in skip_substrings)
+
+
+def _sentinel_ref_for(custom_id: str) -> str:
+    return f"![{SENTINEL_PREFIX}{custom_id}]({SENTINEL_PREFIX}{custom_id}.png)"
+
+
+def _figure_footer(image_full_path: Path, md_path: Path) -> str:
+    """Markdown footer line pointing at the kept image, relative to the .md."""
+    rel = os.path.relpath(image_full_path, md_path.parent)
+    rel = rel.replace("\\", "/")
+    return f"\n\n*Source figure:* ![]({rel})"
+
+
+def _rebuild_md(md_with_refs: str, refs: list, slot_text: list[str]) -> str:
+    """Reconstruct the .md by substituting each ref with slot_text[i].
+
+    Uses match positions rather than `replace()` so that two structurally
+    identical refs are still substituted independently and in order.
+    """
+    out: list[str] = []
+    cursor = 0
+    for match, replacement in zip(refs, slot_text):
+        out.append(md_with_refs[cursor:match.start()])
+        out.append(replacement)
+        cursor = match.end()
+    out.append(md_with_refs[cursor:])
+    return "".join(out)
 
 
 def enrich_figures_for_pdf(
@@ -637,40 +907,56 @@ def enrich_figures_for_pdf(
     batch_state: dict,
     image_root: Path,
     filters: dict,
+    keep_images: bool,
+    rate_limit_tracker: RateLimitTracker,
+    quota_threshold: int,
+    pace_aware: bool,
 ) -> tuple[int, int, int, str | None]:
     """Enrich a single PDF's .md by transcribing every embedded image.
 
     Returns (images_processed, images_failed, images_dropped_size, skip_reason).
-    skip_reason is one of None, "skip-list", "cap-exceeded".
+    skip_reason is None, "skip-list", or "cap-exceeded".
+
+    Raises QuotaExhaustedError if the run-wide max_wait cap is hit; the .md
+    is written in a fully retriable state before the exception propagates.
     """
     if not md_path.exists():
         return 0, 0, 0, None
     original_md = md_path.read_text(encoding="utf-8", errors="ignore")
-    dims = _placeholder_dims(original_md)
-    if not dims:
+    original_placeholders = [m.group(0) for m in PLACEHOLDER_RE.finditer(original_md)]
+    if not original_placeholders:
         return 0, 0, 0, None
 
-    # ---- Filter pass: cheap, no PDF re-extraction needed ----
     if _matches_skip_list(pdf_path, filters.get("skip_substrings") or []):
         return 0, 0, 0, "skip-list"
 
     cap = filters.get("max_per_pdf") or 0
-    if cap > 0 and len(dims) > cap:
+    if cap > 0 and len(original_placeholders) > cap:
         return 0, 0, 0, "cap-exceeded"
+
+    placeholder_sizes = placeholder_dims(original_md)
+    has_dims = len(placeholder_sizes) == len(original_placeholders)
 
     min_w = filters.get("min_w") or 0
     min_h = filters.get("min_h") or 0
-    survivor_indices = [
-        i for i, (w, h) in enumerate(dims)
-        if w >= min_w and h >= min_h
-    ]
-    dropped = len(dims) - len(survivor_indices)
+    if has_dims:
+        survivor_indices = [
+            i for i, (w, h) in enumerate(placeholder_sizes)
+            if w >= min_w and h >= min_h
+        ]
+        dropped = len(original_placeholders) - len(survivor_indices)
+    else:
+        # Some placeholders are [unknown] (recovery output); they bypass the
+        # size filter and all enter the run.
+        survivor_indices = list(range(len(original_placeholders)))
+        dropped = 0
     if not survivor_indices:
         return 0, 0, dropped, None
 
-    # ---- Now re-extract; only spend time on PDFs that have surviving work ----
-    need_persistent = (mode == "command")
-    if need_persistent:
+    # Persistent image dir for command mode and --enrich-keep-images,
+    # otherwise a temp dir we wipe in finally.
+    use_persistent = (mode == "command") or keep_images
+    if use_persistent:
         pdf_hash = hashlib.md5(str(pdf_path.resolve()).encode("utf-8")).hexdigest()[:10]
         img_dir = image_root / f"{pdf_path.stem}_{pdf_hash}"
         img_dir.mkdir(parents=True, exist_ok=True)
@@ -678,6 +964,9 @@ def enrich_figures_for_pdf(
     else:
         img_dir = Path(tempfile.mkdtemp(prefix="pdf2md_imgs_"))
         cleanup = True
+
+    write_md_now = False  # set True on QuotaExhaustedError to flush the .md
+    quota_exception: QuotaExhaustedError | None = None
 
     try:
         md_with_refs = pymupdf4llm.to_markdown(
@@ -691,77 +980,163 @@ def enrich_figures_for_pdf(
         if not refs:
             return 0, 0, dropped, None
 
-        # Sanity check: pymupdf4llm is deterministic, so the number of refs
-        # in the re-extract should equal the number of placeholders we found.
-        # If they diverge, abort filtering for this PDF rather than risk
-        # processing the wrong images.
-        if len(refs) != len(dims):
+        # The placeholder count from pymupdf4llm should equal the ref count;
+        # if it diverges, process all refs (no size filter) rather than
+        # mis-matching placeholders to images.
+        if len(refs) != len(original_placeholders):
             print(f"      WARN: ref count mismatch for {pdf_path.name} "
-                  f"(placeholders={len(dims)}, refs={len(refs)}). "
+                  f"(placeholders={len(original_placeholders)}, refs={len(refs)}). "
                   f"Processing all refs without size filter.")
             chosen = list(range(len(refs)))
             dropped = 0
         else:
-            chosen = survivor_indices
+            chosen = [i for i in survivor_indices if i < len(refs)]
+
+        chosen_set = set(chosen)
+        # Default: every slot keeps its original placeholder. Filtered-out
+        # slots remain as placeholders; chosen slots will be replaced with
+        # transcription (success), sentinel (pending), or placeholder again
+        # (failure / quota).
+        slot_text: list[str] = list(original_placeholders) \
+            if len(original_placeholders) == len(refs) \
+            else [f"![]({m.group(1)})" for m in refs]
 
         if mode in ("api", "claude-cli"):
             processed = failed = 0
-            new_md = md_with_refs
-            total_imgs = len(chosen)
-            for idx, ref_idx in enumerate(chosen, 1):
-                m = refs[ref_idx]
-                ref = m.group(0)
-                img_path = Path(m.group(1))
+            total = len(chosen)
+            for i, ref_idx in enumerate(chosen, 1):
+                match = refs[ref_idx]
+                img_path = Path(match.group(1))
                 if not img_path.is_absolute():
                     img_path = (img_dir / img_path.name).resolve()
-                t0 = time.time()
-                try:
-                    if mode == "api":
-                        replacement = _enrich_image_api(img_path, api_model)
-                    else:
-                        replacement = _enrich_image_cli(img_path, cli_model, claude_bin)
-                    new_md = new_md.replace(ref, replacement, 1)
-                    processed += 1
-                    print(f"      [img {idx}/{total_imgs}] {img_path.name} done "
-                          f"({_fmt_duration(time.time() - t0)})")
-                except Exception as e:
-                    print(f"      [img {idx}/{total_imgs}] enrich error on {img_path.name}: {e}")
-                    failed += 1
+                start = time.time()
+
+                done = False
+                while not done:
+                    try:
+                        if mode == "api":
+                            response, snapshot = _enrich_image_api(img_path, api_model)
+                            rate_limit_tracker.remember(snapshot)
+                        else:
+                            response = _enrich_image_cli(img_path, cli_model, claude_bin)
+
+                        slot_text[ref_idx] = response + (
+                            _figure_footer(img_path, md_path) if keep_images else ""
+                        )
+                        processed += 1
+                        print(f"      [img {i}/{total}] {img_path.name} done "
+                              f"({_fmt_duration(time.time() - start)})")
+                        done = True
+
+                        # Threshold check on the freshly-acquired snapshot.
+                        if (mode == "api" and quota_threshold > 0
+                                and rate_limit_tracker.last_snapshot is not None
+                                and rate_limit_tracker.last_snapshot.max_used_pct()
+                                >= quota_threshold):
+                            snap = rate_limit_tracker.last_snapshot
+                            rate_limit_tracker.sleep_until_reset(
+                                _wait_from_reset(snap.soonest_reset(),
+                                                 rate_limit_tracker.rate_limit_wait_seconds),
+                                f"Quota threshold reached: {snap.max_used_pct():.0f}% used"
+                                f" (resets at {snap.soonest_reset()})",
+                            )
+                        elif (mode == "api" and quota_threshold > 0 and pace_aware
+                              and rate_limit_tracker.projected_to_cross(quota_threshold)):
+                            snap = rate_limit_tracker.last_snapshot
+                            assert snap is not None
+                            rate_limit_tracker.sleep_until_reset(
+                                _wait_from_reset(snap.soonest_reset(),
+                                                 rate_limit_tracker.rate_limit_wait_seconds),
+                                f"Pace-aware: projecting to cross {quota_threshold}%"
+                                f" within next 5 calls",
+                            )
+
+                    except Exception as exc:
+                        err_text = str(exc)
+                        if is_quota_or_rate_limit(err_text):
+                            wait = parse_retry_after(err_text)
+                            # API mode: try the response object's headers too
+                            response_obj = getattr(exc, "response", None)
+                            if wait is None and response_obj is not None:
+                                try:
+                                    snapshot = read_rate_limit_headers(
+                                        response_obj.headers)
+                                    if snapshot is not None:
+                                        wait = _wait_from_reset(
+                                            snapshot.soonest_reset(),
+                                            rate_limit_tracker.rate_limit_wait_seconds,
+                                        )
+                                except Exception:
+                                    pass
+                            if wait is None:
+                                wait = rate_limit_tracker.rate_limit_wait_seconds
+                            try:
+                                rate_limit_tracker.sleep_until_reset(
+                                    wait,
+                                    f"Quota hit on {pdf_path.name} "
+                                    f"img {i}/{total}",
+                                )
+                            except QuotaExhaustedError as quota_exc:
+                                # Restore remaining slots (this one + later) to
+                                # placeholders, mark md for write, propagate.
+                                for later_idx in chosen[i - 1:]:
+                                    slot_text[later_idx] = original_placeholders[later_idx]
+                                quota_exception = quota_exc
+                                write_md_now = True
+                                done = True  # break inner loop
+                            # else: loop and retry the same image
+                        else:
+                            print(f"      [img {i}/{total}] enrich error on "
+                                  f"{img_path.name}: {exc}")
+                            failed += 1
+                            slot_text[ref_idx] = original_placeholders[ref_idx]
+                            done = True
+
+                if quota_exception is not None:
+                    break
+
+            new_md = _rebuild_md(md_with_refs, refs, slot_text)
             md_path.write_text(new_md, encoding="utf-8")
+
+            if quota_exception is not None:
+                raise quota_exception
             return processed, failed, dropped, None
 
         if mode == "batches":
-            md_path.write_text(md_with_refs, encoding="utf-8")
             queued = 0
             for ref_idx in chosen:
-                m = refs[ref_idx]
-                ref = m.group(0)
-                img_path = Path(m.group(1))
+                match = refs[ref_idx]
+                img_path = Path(match.group(1))
                 if not img_path.is_absolute():
                     img_path = (img_dir / img_path.name).resolve()
-                cid = _custom_id_for_image(pdf_path, ref, ref_idx)
+                custom_id = _custom_id_for_image(pdf_path, ref_idx)
+                sentinel = _sentinel_ref_for(custom_id)
                 batch_state["requests"].append({
-                    "custom_id": cid,
+                    "custom_id": custom_id,
                     "params": {
                         "model": api_model,
                         "max_tokens": 4000,
                         "messages": _build_image_api_messages(img_path),
                     },
                 })
-                batch_state["mapping"][cid] = {
+                batch_state["mapping"][custom_id] = {
                     "kind": "image",
                     "md_path": str(md_path),
-                    "image_ref": ref,
+                    "image_ref": sentinel,
                 }
+                slot_text[ref_idx] = sentinel + (
+                    _figure_footer(img_path, md_path) if keep_images else ""
+                )
                 queued += 1
+            new_md = _rebuild_md(md_with_refs, refs, slot_text)
+            md_path.write_text(new_md, encoding="utf-8")
             return queued, 0, dropped, None
 
         if mode == "command":
-            md_path.write_text(md_with_refs, encoding="utf-8")
             queued = 0
             for ref_idx in chosen:
-                m = refs[ref_idx]
-                img_path = Path(m.group(1))
+                match = refs[ref_idx]
+                img_path = Path(match.group(1))
                 if not img_path.is_absolute():
                     img_path = (img_dir / img_path.name).resolve()
                 if _FILENAME_SAFE_RE.search(img_path.name):
@@ -774,13 +1149,159 @@ def enrich_figures_for_pdf(
                 print(f"    CMD: {cmd}")
                 if command_sink is not None:
                     command_sink.write(cmd + "\n")
+                custom_id = _custom_id_for_image(pdf_path, ref_idx)
+                sentinel = _sentinel_ref_for(custom_id)
+                slot_text[ref_idx] = sentinel + (
+                    _figure_footer(img_path, md_path) if keep_images else ""
+                )
                 queued += 1
+            new_md = _rebuild_md(md_with_refs, refs, slot_text)
+            md_path.write_text(new_md, encoding="utf-8")
             return queued, 0, dropped, None
 
         raise ValueError(f"Unknown enrich mode: {mode}")
     finally:
-        if cleanup:
+        if cleanup and not write_md_now:
             shutil.rmtree(img_dir, ignore_errors=True)
+        elif cleanup and write_md_now:
+            shutil.rmtree(img_dir, ignore_errors=True)
+
+
+def _wait_from_reset(reset_iso: str, fallback_seconds: float) -> float:
+    """Convert an ISO-8601 reset timestamp into seconds-from-now, with a
+    fallback when the timestamp is missing or unparseable."""
+    if not reset_iso:
+        return fallback_seconds
+    try:
+        from datetime import datetime, timezone
+        cleaned = reset_iso.rstrip("Z")
+        if cleaned.endswith("+00:00") or cleaned.count("+") + cleaned.count("-") >= 2:
+            target = datetime.fromisoformat(cleaned)
+        else:
+            target = datetime.fromisoformat(cleaned).replace(tzinfo=timezone.utc)
+        delta = (target - datetime.now(timezone.utc)).total_seconds()
+        return max(delta, 1.0)
+    except Exception:
+        return fallback_seconds
+
+
+# === Recovery ===
+# Convert dead markdown image refs (pointing at files that no longer exist
+# on disk) back to retriable placeholders so a subsequent --enrich-figures
+# pass picks them up.
+
+def restore_broken_image_refs(root: Path) -> tuple[int, int]:
+    """Walk root, replace IMAGE_REFs whose target file is missing with the
+    [unknown] placeholder. Returns (md_files_updated, refs_restored)."""
+    files_updated = 0
+    refs_restored = 0
+    placeholder_unknown = "**==> picture [unknown] intentionally omitted <==**"
+
+    md_files = sorted(root.rglob("*.md"))
+    for md_path in md_files:
+        try:
+            text = md_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if "![" not in text:
+            continue
+
+        original = text
+        rewritten_parts: list[str] = []
+        cursor = 0
+        local_refs_restored = 0
+
+        for match in IMAGE_REF_RE.finditer(text):
+            ref_target = match.group(1)
+            target_path = Path(ref_target)
+            if not target_path.is_absolute():
+                target_path = (md_path.parent / target_path).resolve()
+
+            if target_path.exists():
+                continue
+
+            rewritten_parts.append(text[cursor:match.start()])
+            rewritten_parts.append(placeholder_unknown)
+            cursor = match.end()
+            local_refs_restored += 1
+
+        if local_refs_restored == 0:
+            continue
+        rewritten_parts.append(text[cursor:])
+        new_text = "".join(rewritten_parts)
+        if new_text != original:
+            md_path.write_text(new_text, encoding="utf-8")
+            files_updated += 1
+            refs_restored += local_refs_restored
+            try:
+                rel = md_path.relative_to(root)
+            except ValueError:
+                rel = md_path
+            print(f"  restored {local_refs_restored} broken ref(s) in {rel}")
+
+    return files_updated, refs_restored
+
+
+# === Pipeline ===
+# Wallclock helpers, per-PDF conversion worker, dry-run, dispatch.
+
+def convert_with_pymupdf4llm(pdf_path: Path, md_path: Path, ocr_kwargs: dict) -> None:
+    md_text = pymupdf4llm.to_markdown(str(pdf_path), **ocr_kwargs)
+    md_path.write_text(md_text, encoding="utf-8")
+
+
+def _convert_worker(task: tuple) -> tuple:
+    """Module-level worker for multiprocessing.Pool (Windows spawn requires
+    this to be picklable). Returns (pdf_path_str, status, err_or_none)."""
+    pdf_path_str, md_path_str, ocr_kwargs = task
+    try:
+        md_text = pymupdf4llm.to_markdown(pdf_path_str, **ocr_kwargs)
+        Path(md_path_str).write_text(md_text, encoding="utf-8")
+        return (pdf_path_str, "ok", None)
+    except Exception as exc:
+        return (pdf_path_str, "error", str(exc))
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Render seconds as 'Xs', 'Xm Ys', or 'Xh Ym'."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+def _progress_suffix(start_time: float, done: int, total: int) -> str:
+    """'(elapsed 2m 30s, ETA 5m 10s)' from rolling wallclock average."""
+    if done == 0 or total == 0:
+        return ""
+    elapsed = time.time() - start_time
+    remaining = total - done
+    eta = (elapsed / done) * remaining if remaining > 0 else 0
+    return f"(elapsed {_fmt_duration(elapsed)}, ETA {_fmt_duration(eta)})"
+
+
+def dispatch_fallback(
+    pdf_path: Path,
+    md_path: Path,
+    mode: str,
+    api_model: str,
+    cli_model: str,
+    claude_bin: str,
+    command_sink,
+    batch_state: dict,
+) -> None:
+    if mode == "api":
+        fallback_api(pdf_path, md_path, api_model)
+    elif mode == "claude-cli":
+        fallback_claude_cli(pdf_path, md_path, cli_model, claude_bin)
+    elif mode == "command":
+        fallback_command_only(pdf_path, md_path, cli_model, command_sink)
+    elif mode == "batches":
+        fallback_batches_collect(pdf_path, md_path, api_model, batch_state)
+    else:
+        raise ValueError(f"Unknown fallback mode: {mode}")
 
 
 def _sample_runtime_estimate(
@@ -793,15 +1314,7 @@ def _sample_runtime_estimate(
     sample_size: int = 5,
 ) -> tuple[float, float] | None:
     """Sample N PDFs, time their re-extraction + one image call each, then
-    extrapolate to the whole survivor set.
-
-    `survivors` is a list of (pdf_path, md_path, survivor_indices) tuples.
-    Returns (low_seconds, high_seconds) for the whole run, or None if the
-    sample produced no usable timings.
-
-    NOTE: this makes real Claude calls. Used only when --enrich-dry-run is
-    paired with a synchronous transport (claude-cli / api).
-    """
+    extrapolate to the whole survivor set. Makes real Claude calls."""
     eligible = [s for s in survivors if s[2]]
     if not eligible:
         return None
@@ -819,17 +1332,17 @@ def _sample_runtime_estimate(
         try:
             with tempfile.TemporaryDirectory(prefix="pdf2md_dryimgs_") as tmp_str:
                 tmp = Path(tmp_str)
-                t0 = time.time()
+                start = time.time()
                 try:
                     md_text = pymupdf4llm.to_markdown(
                         str(pdf_path), write_images=True,
                         image_path=str(tmp), image_format="png",
                         **ocr_kwargs,
                     )
-                except Exception as e:
-                    print(f"      re-extract failed: {e}")
+                except Exception as exc:
+                    print(f"      re-extract failed: {exc}")
                     continue
-                extract_dt = time.time() - t0
+                extract_dt = time.time() - start
                 extract_times.append(extract_dt)
                 print(f"      re-extract: {_fmt_duration(extract_dt)}")
 
@@ -844,7 +1357,7 @@ def _sample_runtime_estimate(
                 if not img_path.exists():
                     continue
 
-                t0 = time.time()
+                start = time.time()
                 try:
                     if mode == "claude-cli":
                         _enrich_image_cli(img_path, cli_model, claude_bin)
@@ -852,13 +1365,13 @@ def _sample_runtime_estimate(
                         _enrich_image_api(img_path, api_model)
                     else:
                         return None
-                    img_dt = time.time() - t0
+                    img_dt = time.time() - start
                     image_times.append(img_dt)
                     print(f"      image call: {_fmt_duration(img_dt)}")
-                except Exception as e:
-                    print(f"      image call failed: {e}")
-        except Exception as e:
-            print(f"      sample error: {e}")
+                except Exception as exc:
+                    print(f"      image call failed: {exc}")
+        except Exception as exc:
+            print(f"      sample error: {exc}")
 
     if not extract_times or not image_times:
         return None
@@ -871,7 +1384,7 @@ def _sample_runtime_estimate(
     image_lo = min(image_times)
     image_hi = max(image_times)
 
-    # If we only got one sample, give a ±20% margin instead of a flat range.
+    # If we only got one sample, give a +/-20% margin instead of a flat range.
     if len(extract_times) == 1:
         extract_lo *= 0.8
         extract_hi *= 1.2
@@ -913,8 +1426,6 @@ def enrich_figures_dry_run(
     images_dropped_size = 0
     images_to_enrich = 0
     pdfs_to_enrich = 0
-
-    # Per-PDF survivor data, kept around for the timing-sample step.
     survivors: list[tuple[Path, Path, list[int]]] = []
 
     for pdf_path in pdf_files:
@@ -925,25 +1436,25 @@ def enrich_figures_dry_run(
             md = md_path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-        dims = _placeholder_dims(md)
-        if not dims:
+        sizes = placeholder_dims(md)
+        if not sizes:
             continue
         candidate_pdfs += 1
-        total_placeholders += len(dims)
+        total_placeholders += len(sizes)
 
         if _matches_skip_list(pdf_path, skip_subs):
-            skipped_skiplist.append((pdf_path, len(dims)))
-            images_in_skip_pdfs += len(dims)
+            skipped_skiplist.append((pdf_path, len(sizes)))
+            images_in_skip_pdfs += len(sizes)
             continue
 
-        if cap > 0 and len(dims) > cap:
-            skipped_cap.append((pdf_path, len(dims)))
-            images_in_cap_pdfs += len(dims)
+        if cap > 0 and len(sizes) > cap:
+            skipped_cap.append((pdf_path, len(sizes)))
+            images_in_cap_pdfs += len(sizes)
             continue
 
-        survivor_idx = [i for i, (w, h) in enumerate(dims)
+        survivor_idx = [i for i, (w, h) in enumerate(sizes)
                         if w >= min_w and h >= min_h]
-        images_dropped_size += len(dims) - len(survivor_idx)
+        images_dropped_size += len(sizes) - len(survivor_idx)
         images_to_enrich += len(survivor_idx)
         if survivor_idx:
             pdfs_to_enrich += 1
@@ -959,12 +1470,12 @@ def enrich_figures_dry_run(
         print(f"  - skipped by per-PDF cap (>{cap}):    {len(skipped_cap):>6}  "
               f"({images_in_cap_pdfs} placeholders)")
         worst = sorted(skipped_cap, key=lambda x: -x[1])[:5]
-        for p, n in worst:
+        for path, count in worst:
             try:
-                rel = p.relative_to(root)
+                rel = path.relative_to(root)
             except ValueError:
-                rel = p
-            print(f"      {n:>5} placeholders  {rel}")
+                rel = path
+            print(f"      {count:>5} placeholders  {rel}")
     print(f"Total placeholders found:           {total_placeholders:>7}")
     if images_in_skip_pdfs:
         print(f"  - in skip-list PDFs:              {images_in_skip_pdfs:>7}")
@@ -980,7 +1491,6 @@ def enrich_figures_dry_run(
     high = images_to_enrich * _COST_PER_IMAGE_HIGH
     print(f"Estimated cost: ~${low:,.2f} - ${high:,.2f}  (Sonnet 4.6 vision via batches)")
 
-    # ---------- runtime estimate ----------
     if images_to_enrich == 0:
         return
     if mode in ("claude-cli", "api"):
@@ -1003,78 +1513,10 @@ def enrich_figures_dry_run(
         print("Estimated time: pass --fallback {claude-cli|api|batches} to get a runtime estimate.")
 
 
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
+# === CLI ===
+# argparse plumbing and the top-level run loop.
 
-def convert_with_pymupdf4llm(pdf_path: Path, md_path: Path, ocr_kwargs: dict) -> None:
-    md_text = pymupdf4llm.to_markdown(str(pdf_path), **ocr_kwargs)
-    md_path.write_text(md_text, encoding="utf-8")
-
-
-def _convert_worker(task: tuple) -> tuple:
-    """Module-level worker for multiprocessing.Pool (Windows spawn needs
-    this to be picklable). Returns (pdf_path_str, status, err_or_none)."""
-    pdf_path_str, md_path_str, ocr_kwargs = task
-    try:
-        md_text = pymupdf4llm.to_markdown(pdf_path_str, **ocr_kwargs)
-        Path(md_path_str).write_text(md_text, encoding="utf-8")
-        return (pdf_path_str, "ok", None)
-    except Exception as e:
-        return (pdf_path_str, "error", str(e))
-
-
-def _fmt_duration(seconds: float) -> str:
-    """Render seconds as 'Xs', 'Xm Ys', or 'Xh Ym'."""
-    seconds = max(0, int(seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60:02d}s"
-    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
-
-
-def _progress_suffix(start_time: float, done: int, total: int) -> str:
-    """'(elapsed 2m 30s, ETA 5m 10s)' using wallclock avg per task."""
-    if done == 0 or total == 0:
-        return ""
-    elapsed = time.time() - start_time
-    remaining = total - done
-    eta = (elapsed / done) * remaining if remaining > 0 else 0
-    return f"(elapsed {_fmt_duration(elapsed)}, ETA {_fmt_duration(eta)})"
-
-
-def dispatch_fallback(
-    pdf_path: Path,
-    md_path: Path,
-    mode: str,
-    api_model: str,
-    cli_model: str,
-    claude_bin: str,
-    command_sink,
-    batch_state: dict,
-) -> None:
-    if mode == "api":
-        fallback_api(pdf_path, md_path, api_model)
-    elif mode == "claude-cli":
-        fallback_claude_cli(pdf_path, md_path, cli_model, claude_bin)
-    elif mode == "command":
-        fallback_command_only(pdf_path, md_path, cli_model, command_sink)
-    elif mode == "batches":
-        fallback_batches_collect(pdf_path, md_path, api_model, batch_state)
-    else:
-        raise ValueError(f"Unknown fallback mode: {mode}")
-
-
-def main():
-    # Windows cp1252 stdout crashes on unicode chars in error messages.
-    # Also force line-buffering so progress shows up when piped / run in background.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
-        sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
-    except AttributeError:
-        pass
-
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert PDFs to LLM-friendly Markdown, with optional triage + "
                     "Claude fallback and per-image enrichment.",
@@ -1091,7 +1533,6 @@ def main():
              "(default: 1). Triage, fallback, and enrich stages stay sequential.",
     )
 
-    # OCR (handled by pymupdf4llm itself, via Tesseract)
     parser.add_argument("--ocr", choices=["auto", "always", "never"], default="auto",
                         help="OCR for image-only pages via pymupdf4llm/Tesseract "
                              "(auto = use_ocr, always = force_ocr, never = disable)")
@@ -1100,28 +1541,25 @@ def main():
     parser.add_argument("--ocr-lang", default="eng",
                         help="Tesseract language (default: eng; e.g. 'eng+deu')")
 
-    # Triage
     parser.add_argument("--triage", action="store_true",
                         help="After each conversion, flag PDFs that likely need better extraction")
     parser.add_argument("--triage-only", action="store_true",
                         help="Skip conversion; only scan existing .md files and flag problems")
     parser.add_argument("--min-chars-per-page", type=int, default=100,
-                        help="Below this chars/page in the .md, output is considered minimal (default: 100)")
+                        help="Below this chars/page in the .md, output is considered minimal "
+                             "(default: 100)")
 
-    # Figure enrichment
     parser.add_argument("--enrich-figures", action="store_true",
                         help="Transcribe embedded images (tables/formulas/charts) via Claude; "
                              "requires --fallback to choose a transport")
     parser.add_argument("--enrich-max-images-per-pdf", type=int, default=0,
                         metavar="N",
                         help="Skip PDFs with more than N image placeholders "
-                             "(0 = no cap, default). Useful for skipping textbooks/reports "
-                             "with hundreds of decorative images.")
+                             "(0 = no cap, default).")
     parser.add_argument("--enrich-min-image-pixels", nargs=2, type=int,
                         default=[0, 0], metavar=("W", "H"),
                         help="Drop image placeholders smaller than W x H "
-                             "(default: 0 0 = no filter). E.g. '30 30' drops "
-                             "bullets/icons/separators.")
+                             "(default: 0 0 = no filter).")
     parser.add_argument("--enrich-skip-pdfs", default=None, metavar="FILE",
                         help="Plain-text file of substrings (one per line). "
                              "PDFs whose path matches any line are skipped entirely. "
@@ -1129,8 +1567,36 @@ def main():
     parser.add_argument("--enrich-dry-run", action="store_true",
                         help="Iterate the library, print projected counts and a cost "
                              "estimate, then exit. No re-extraction, no Claude calls.")
+    parser.add_argument("--enrich-keep-images", action="store_true",
+                        help="Preserve extracted image files alongside the .md and append a "
+                             "*Source figure:* footer to each enriched slot. Aligns with "
+                             "vision-LLM SecondBrain workflows where the original figure may "
+                             "be viewed for additional context after reading the text.")
+    parser.add_argument("--enrich-restore-broken", action="store_true",
+                        help="Standalone repair: find IMAGE_REFs in every .md whose target "
+                             "file no longer exists and replace them with [unknown] placeholders "
+                             "so a subsequent --enrich-figures pass can retry them. No PDF "
+                             "re-conversion, no Claude calls.")
 
-    # Fallback
+    parser.add_argument("--enrich-rate-limit-wait", type=int, default=3600,
+                        metavar="SECONDS",
+                        help="Default sleep when a rate-limit error fires and no Retry-After "
+                             "hint is parseable from the error (default: 3600 = 1 hour).")
+    parser.add_argument("--enrich-max-wait", type=int, default=14400,
+                        metavar="SECONDS",
+                        help="Run-wide cap on total time spent sleeping for quota recovery "
+                             "(default: 14400 = 4 hours). Once exceeded, the run stops cleanly "
+                             "with the .md files in a retriable state.")
+    parser.add_argument("--enrich-quota-threshold", type=int, default=0,
+                        metavar="PCT",
+                        help="API mode only: when anthropic-ratelimit-* headers report at least "
+                             "PCT%% used, sleep until reset before the next call. "
+                             "(1-99; 0 = disabled, default).")
+    parser.add_argument("--enrich-pace-aware", action="store_true",
+                        help="API mode only, on top of --enrich-quota-threshold: extrapolate the "
+                             "slope of usage over the last two API calls and sleep proactively "
+                             "if the threshold is projected to be crossed within the next 5 calls.")
+
     parser.add_argument("--fallback",
                         choices=["api", "claude-cli", "command", "batches", "none"],
                         default="none",
@@ -1142,54 +1608,81 @@ def main():
     parser.add_argument("--claude-bin", default=None,
                         help="Path to claude CLI (default: auto-detect)")
     parser.add_argument("--command-file", default=None,
-                        help="Path for --fallback command output file (default: <root>/pdf2md_triage_commands.txt)")
+                        help="Path for --fallback command output file "
+                             "(default: <project>/output/pdf2md_triage_commands_<libhash>.txt)")
+    parser.add_argument("--state-dir", default=None,
+                        help="Directory for batch state JSON "
+                             "(default: <project>/state/)")
     parser.add_argument("--resume-batch", action="store_true",
                         help="Poll the last submitted batch and write results (no conversion/triage)")
     parser.add_argument("--check", action="store_true",
-                        help="Verify that dependencies (Tesseract, claude CLI, anthropic) are installed and exit")
+                        help="Verify dependencies (Tesseract, claude CLI, anthropic) and exit")
+    return parser
 
+
+def _run_check() -> None:
+    print("Checking dependencies...\n")
+    print("For local extraction (pymupdf4llm OCR — scanned PDFs):")
+    tess = shutil.which("tesseract")
+    if tess:
+        print(f"  [OK]   Tesseract: {tess}")
+    else:
+        print("  [MISS] Tesseract not on PATH. Install:")
+        for line in TESSERACT_INSTALL_HINT.splitlines():
+            print(f"         {line}")
+
+    print("\nFor --fallback claude-cli  (uses your Claude Max subscription):")
+    try:
+        resolved = resolve_claude_executable(verify=True)
+        print(f"  [OK]   Claude Code CLI: {resolved}")
+    except RuntimeError as exc:
+        print("  [MISS] Claude Code CLI not available.")
+        for line in str(exc).splitlines():
+            print(f"         {line}")
+
+    print("\nFor --fallback api / batches  (uses Anthropic API, billed per token):")
+    try:
+        import anthropic  # noqa: F401
+        print("  [OK]   anthropic package installed")
+    except ImportError:
+        print("  [MISS] anthropic package not installed. Install: pip install anthropic")
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        print("  [OK]   ANTHROPIC_API_KEY is set")
+    else:
+        print("  [n/a]  ANTHROPIC_API_KEY not set "
+              "(only required if you use --fallback api or batches)")
+
+
+def main() -> None:
+    # Windows cp1252 stdout crashes on unicode chars in error messages.
+    # Force line-buffering so progress shows up when piped or backgrounded.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+        sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
+    except AttributeError:
+        pass
+
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
-    # --- Standalone check: verify dependencies ---
     if args.check:
-        print("Checking dependencies...\n")
-        print("For local extraction (pymupdf4llm OCR — scanned PDFs):")
-        tess = shutil.which("tesseract")
-        if tess:
-            print(f"  [OK]   Tesseract: {tess}")
-        else:
-            print("  [MISS] Tesseract not on PATH. Install:")
-            for line in TESSERACT_INSTALL_HINT.splitlines():
-                print(f"         {line}")
-
-        print("\nFor --fallback claude-cli  (uses your Claude Max subscription):")
-        try:
-            resolved = resolve_claude_executable(verify=True)
-            print(f"  [OK]   Claude Code CLI: {resolved}")
-        except RuntimeError as e:
-            print("  [MISS] Claude Code CLI not available.")
-            for line in str(e).splitlines():
-                print(f"         {line}")
-
-        print("\nFor --fallback api / batches  (uses Anthropic API, billed per token):")
-        try:
-            import anthropic  # noqa: F401
-            print("  [OK]   anthropic package installed")
-        except ImportError:
-            print("  [MISS] anthropic package not installed. Install: pip install anthropic")
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            print("  [OK]   ANTHROPIC_API_KEY is set")
-        else:
-            print("  [n/a]  ANTHROPIC_API_KEY not set "
-                  "(only required if you use --fallback api or batches)")
+        _run_check()
         return
+
+    state_dir = Path(args.state_dir) if args.state_dir else STATE_DIR_DEFAULT
+    output_dir = OUTPUT_DIR_DEFAULT
 
     if args.enrich_dry_run and not args.enrich_figures:
         print("Error: --enrich-dry-run requires --enrich-figures.")
         sys.exit(1)
-    if args.enrich_figures and args.fallback == "none" and not args.enrich_dry_run:
+    if (args.enrich_figures and args.fallback == "none"
+            and not args.enrich_dry_run and not args.enrich_restore_broken):
         print("Error: --enrich-figures requires --fallback (api | claude-cli | batches | command), "
               "or pair with --enrich-dry-run for an estimate-only run.")
+        sys.exit(1)
+    if args.enrich_quota_threshold and (
+            args.enrich_quota_threshold < 1 or args.enrich_quota_threshold > 99):
+        print("Error: --enrich-quota-threshold must be between 1 and 99 (or 0 to disable).")
         sys.exit(1)
 
     root = Path(args.root_dir) if args.root_dir else None
@@ -1197,11 +1690,18 @@ def main():
         print(f"Error: '{args.root_dir}' is not a valid directory.")
         sys.exit(1)
 
-    if args.resume_batch:
-        resume_batch(root)
+    if args.enrich_restore_broken:
+        print(f"=== Restoring broken image refs in {root} ===")
+        files_updated, refs_restored = restore_broken_image_refs(root)
+        print(f"\nRestored {refs_restored} ref(s) across {files_updated} .md file(s).")
+        if refs_restored:
+            print("Re-run with --enrich-figures to retry the [unknown] placeholders.")
         return
 
-    # Build enrichment filters once; reused by dry-run and the real pass.
+    if args.resume_batch:
+        resume_batch(root, state_dir)
+        return
+
     enrich_filters = {
         "max_per_pdf": args.enrich_max_images_per_pdf,
         "min_w": args.enrich_min_image_pixels[0],
@@ -1220,11 +1720,11 @@ def main():
         print(f"Loaded {len(enrich_filters['skip_substrings'])} skip-list entries "
               f"from {skip_path}")
 
-    # Tesseract preflight (unless OCR is disabled)
     if args.ocr != "never":
         tess = shutil.which("tesseract")
         if tess:
-            print(f"Tesseract OCR: {tess}  (mode={args.ocr}, dpi={args.ocr_dpi}, lang={args.ocr_lang})")
+            print(f"Tesseract OCR: {tess}  (mode={args.ocr}, dpi={args.ocr_dpi}, "
+                  f"lang={args.ocr_lang})")
         else:
             print("Warning: Tesseract not on PATH — pymupdf4llm OCR will be a no-op.")
             print("         Use --ocr never to silence this, or install Tesseract:")
@@ -1237,14 +1737,10 @@ def main():
     if not pdf_files:
         return
 
-    # Preflight claude CLI if needed — for the regular --fallback claude-cli
-    # path AND for --enrich-dry-run with --fallback claude-cli (timing sample).
     claude_bin = args.claude_bin
     if args.fallback == "claude-cli":
         claude_bin = preflight_claude_cli(claude_bin)
 
-    # Dry-run short-circuit. Now after preflights so the timing sample has a
-    # working transport.
     if args.enrich_dry_run:
         enrich_figures_dry_run(
             pdf_files, root, enrich_filters,
@@ -1256,24 +1752,43 @@ def main():
         )
         return
 
+    # Threshold/pace flags only make sense for --fallback api.
+    if args.enrich_quota_threshold and args.fallback != "api":
+        print("NOTE: --enrich-quota-threshold applies only to --fallback api. "
+              f"Running with --fallback {args.fallback}, the proactive threshold "
+              "is ignored; reactive auto-resume on rate-limit errors still applies.")
+    if args.enrich_pace_aware and args.fallback != "api":
+        print("NOTE: --enrich-pace-aware applies only to --fallback api; ignored.")
+
     command_sink = None
     if args.fallback == "command":
-        cmd_path = Path(args.command_file) if args.command_file else root / "pdf2md_triage_commands.txt"
+        if args.command_file:
+            cmd_path = Path(args.command_file)
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            cmd_path = triage_command_path(root, output_dir)
+        cmd_path.parent.mkdir(parents=True, exist_ok=True)
         command_sink = open(cmd_path, "w", encoding="utf-8")
         command_sink.write("# Run these commands to re-process flagged PDFs / enrich images via Claude Code.\n\n")
         print(f"Writing fallback commands to: {cmd_path}")
 
     batch_state = {"requests": [], "mapping": {}}
-    image_root = root / "pdf2md_enrich_images"
+    image_root = root / IMAGE_ROOT_NAME
+
+    rate_limit_tracker = RateLimitTracker(
+        max_wait_seconds=float(args.enrich_max_wait),
+        rate_limit_wait_seconds=float(args.enrich_rate_limit_wait),
+    )
 
     success = skipped = failed = flagged = fallback_ok = fallback_fail = 0
     enrich_mds = enrich_imgs = enrich_fail = 0
     enrich_pdfs_skipped = enrich_imgs_dropped = 0
-    flagged_report = []
-    convert_failures: set[str] = set()  # pdf_path strs that failed convert
+    flagged_report: list[tuple[Path, list[str], bool]] = []
+    convert_failures: set[str] = set()
+    quota_stopped = False
 
     try:
-        # ---------------------------- Pass A: convert ----------------------------
+        # Pass A: convert
         if not args.triage_only:
             convert_tasks = []
             for pdf_path in pdf_files:
@@ -1315,31 +1830,31 @@ def main():
                     try:
                         convert_with_pymupdf4llm(pdf_path, md_path, ocr_kwargs)
                         success += 1
-                    except Exception as e:
-                        print(f"  ERROR: {e}")
+                    except Exception as exc:
+                        print(f"  ERROR: {exc}")
                         failed += 1
                         convert_failures.add(pdf_path_str)
                 print(f"Conversion wallclock: {_fmt_duration(time.time() - start_time)}")
 
-        # ------------------- Pass B: triage / fallback / enrich ------------------
+        # Pass B: triage / fallback / enrich
         if args.triage or args.triage_only or args.enrich_figures:
             for i, pdf_path in enumerate(pdf_files, 1):
                 md_path = pdf_path.with_suffix(".md")
-                tag = f"[{i}/{len(pdf_files)}]"
+                progress_tag = f"[{i}/{len(pdf_files)}]"
 
                 if str(pdf_path) in convert_failures:
                     continue
 
-                # Triage / full-PDF fallback
                 if args.triage or args.triage_only:
-                    reasons, should_fallback = triage(pdf_path, md_path, args.min_chars_per_page)
+                    reasons, should_fallback = triage(
+                        pdf_path, md_path, args.min_chars_per_page)
                     if reasons:
                         flagged_report.append((pdf_path, reasons, should_fallback))
                     if should_fallback:
                         flagged += 1
-                        print(f"{tag} FLAGGED: {pdf_path.name}")
-                        for r in reasons:
-                            print(f"    * {r}")
+                        print(f"{progress_tag} FLAGGED: {pdf_path.name}")
+                        for reason in reasons:
+                            print(f"    * {reason}")
                         if args.fallback != "none":
                             try:
                                 print(f"    -> fallback={args.fallback}")
@@ -1348,43 +1863,54 @@ def main():
                                                   claude_bin or "claude",
                                                   command_sink, batch_state)
                                 fallback_ok += 1
-                            except Exception as e:
-                                print(f"    FALLBACK ERROR: {e}")
+                            except Exception as exc:
+                                print(f"    FALLBACK ERROR: {exc}")
                                 fallback_fail += 1
                                 continue
 
-                # Figure enrichment
                 if args.enrich_figures and md_path.exists():
                     try:
-                        processed, failed_imgs, dropped, skip_reason = enrich_figures_for_pdf(
-                            pdf_path, md_path, args.fallback,
-                            args.api_model, args.cli_model,
-                            claude_bin or "claude",
-                            ocr_kwargs, command_sink, batch_state, image_root,
-                            enrich_filters,
+                        processed, failed_imgs, dropped, skip_reason = (
+                            enrich_figures_for_pdf(
+                                pdf_path, md_path, args.fallback,
+                                args.api_model, args.cli_model,
+                                claude_bin or "claude",
+                                ocr_kwargs, command_sink, batch_state, image_root,
+                                enrich_filters,
+                                keep_images=args.enrich_keep_images,
+                                rate_limit_tracker=rate_limit_tracker,
+                                quota_threshold=args.enrich_quota_threshold,
+                                pace_aware=args.enrich_pace_aware,
+                            )
                         )
                         if skip_reason:
                             enrich_pdfs_skipped += 1
-                            print(f"{tag} SKIP-ENRICH ({skip_reason}): {pdf_path.name}")
+                            print(f"{progress_tag} SKIP-ENRICH ({skip_reason}): {pdf_path.name}")
                         elif processed or failed_imgs:
                             enrich_mds += 1
                             enrich_imgs += processed
                             enrich_fail += failed_imgs
                             enrich_imgs_dropped += dropped
                             extra = f", dropped: {dropped}" if dropped else ""
-                            print(f"{tag} ENRICHED: {pdf_path.name} "
+                            print(f"{progress_tag} ENRICHED: {pdf_path.name} "
                                   f"(images: {processed}, failed: {failed_imgs}{extra})")
                         elif dropped:
                             enrich_imgs_dropped += dropped
-                    except Exception as e:
-                        print(f"    ENRICH ERROR on {pdf_path.name}: {e}")
+                    except QuotaExhaustedError as quota_exc:
+                        quota_stopped = True
+                        print(f"\n=== {quota_exc} ===")
+                        print("Stopping enrichment cleanly. The .md files are in a "
+                              "retriable state — re-run later to continue.")
+                        break
+                    except Exception as exc:
+                        print(f"    ENRICH ERROR on {pdf_path.name}: {exc}")
                         enrich_fail += 1
     finally:
         if command_sink is not None:
             command_sink.close()
 
     if args.fallback == "batches":
-        submit_batch(batch_state, root)
+        submit_batch(batch_state, root, state_dir)
 
     print()
     if not args.triage_only:
@@ -1400,7 +1926,11 @@ def main():
             line += f", pdfs-skipped: {enrich_pdfs_skipped}"
         if enrich_imgs_dropped:
             line += f", images-dropped (size): {enrich_imgs_dropped}"
+        if rate_limit_tracker.total_slept > 0:
+            line += f", slept: {_fmt_duration(rate_limit_tracker.total_slept)}"
         print(line)
+        if quota_stopped:
+            print("(Run stopped early on quota cap. .md files are retriable.)")
 
     if flagged_report:
         print("\nAll observations:")
@@ -1408,8 +1938,8 @@ def main():
             rel = pdf.relative_to(root) if pdf.is_relative_to(root) else pdf
             marker = "!" if needs else " "
             print(f"  {marker} {rel}")
-            for r in reasons:
-                print(f"      * {r}")
+            for reason in reasons:
+                print(f"      * {reason}")
 
 
 if __name__ == "__main__":
