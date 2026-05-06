@@ -7,6 +7,8 @@ Convert PDFs to LLM-friendly Markdown.
 
 > Built with Claude Opus 4.7 (Anthropic).
 
+> Most operations are local. The 🌐 marker tags anything that calls Claude or needs `ANTHROPIC_API_KEY` / a Claude Pro/Max subscription. Run `python pdf2md.py --check` to see which local and online capabilities your machine has.
+
 ---
 
 ## 1. Acknowledgments
@@ -24,23 +26,26 @@ This tool stands on a few cornerstone projects:
 
 ## 2. Use cases
 
-Convert a literature-management library (Zotero, Mendeley, Papers, or just a folder tree of PDFs) into Markdown so an LLM can read and reason over your full corpus. A natural follow-on is Karpathy's [LLM-maintained personal wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) pattern — Markdown is the storage layer for that "SecondBrain"; pdf2md4llm fills the layer with high-quality text, formulas, and figure descriptions so the LLM can synthesize across sources.
+Convert a literature-management library (Zotero, Mendeley, Papers, or just a folder tree of PDFs) into Markdown so an LLM can read and reason over your full corpus. The Markdown is the storage layer; pdf2md4llm fills it with high-quality text, formulas, and figure descriptions so downstream tools can synthesize across sources.
 
-For SecondBrain workflows specifically, pass `--enrich-keep-images` so the original figure files are preserved alongside their transcriptions. A vision-capable LLM can then read the text first and view the referenced figures separately when needed, matching the pattern Karpathy describes for image-bearing notes.
+Two example downstream workflows that pair well with pdf2md4llm:
+
+- **SecondBrain wiki** — Karpathy's [LLM-maintained personal wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) pattern. A vision-capable LLM reads the Markdown first, then pulls up the original figure when needed. Pass `--enrich-keep-images` so figure files survive next to their transcriptions for that lookup.
+- **researcher-pack** — Andre Huang's [Claude Code research workflow](https://github.com/andrehuang/researcher-pack) keeps reading, ideation, experiments, and writing connected through a shared plain-text wiki. Its `/paper-read` command ingests papers into that wiki — pdf2md4llm produces the high-fidelity Markdown those papers become.
 
 ---
 
 ## 3. What you need
 
-| Need | For |
-|---|---|
-| Python 3.10+ | running the script |
-| `pip install -r requirements.txt` (or `uv sync`) | `pymupdf4llm`, `anthropic` |
-| Tesseract on PATH | OCR for scanned pages (see below) |
-| Claude Code CLI | `--fallback claude-cli` (uses your Pro/Max subscription) |
-| `ANTHROPIC_API_KEY` | `--fallback api` / `batches` |
+| Need | For | Type |
+|---|---|---|
+| Python 3.10+ | running the script | local |
+| `pip install -r requirements.txt` (or `uv sync`) | `pymupdf4llm`, `anthropic` | local |
+| Tesseract on PATH | OCR for scanned pages (see below) | local |
+| Claude Code CLI | 🌐 `--fallback claude-cli` (Pro/Max subscription) | online |
+| `ANTHROPIC_API_KEY` | 🌐 `--fallback api` / `batches`, `--enrich-figures` via API | online |
 
-Run `python pdf2md.py --check` to verify each piece.
+Run `python pdf2md.py --check` to verify each piece. The output is split into **Local-only capabilities** (work offline) and **Online capabilities** (need internet + Claude access).
 
 ### Tesseract install
 
@@ -66,44 +71,59 @@ Both flows produce the same outcome.
 
 ---
 
-## 4. Quick start
+## 4. Recommended workflows
 
-End-to-end conversion of a Zotero `storage/` folder, including text, OCR, and figure transcription. Two transports — pick whichever matches your account.
+Pick the row matching your goal; run the numbered commands in order. `ROOT` is your library directory (e.g. `"/path/to/Zotero/storage"`).
 
-### Path A: Anthropic API via batches (~50% cheaper, ~1 h turnaround)
+| # | Goal | Online? | Sequence |
+|---|---|---|---|
+| 1 | **Convert library — text + OCR only, no LLM** | local | `A1` |
+| 2 | **Add new PDFs to an already-converted library** | local | `A1` (incremental: skips existing `.md`s) |
+| 3 | **Convert + enrich figures cheaply** | 🌐 online | `A1`, `B0` (dry-run preview), `B1` (submit batch), `B2` (resume) |
+| 4 | **Convert + flag broken PDFs + Claude-fix them** | 🌐 online | `A1`, `C1` (triage-only batches), `B2` (resume) |
+| 5 | **Recover a library after a failed enrichment run** | local + 🌐 | `D1` (restore broken refs), then row 3 to retry |
+| 6 | **Run overnight on a Pro/Max subscription** | 🌐 online | `A1`, `E1` (claude-cli with auto-resume on quota) |
+| 7 | **Just check what enrichment would cost** | local | `B0` |
+| 8 | **Re-triage to find newly-broken PDFs (incremental)** | local | `F1` (cached; near-instant on a stable library) |
+
+### Command catalogue
 
 ```bash
-# 1. Local pass: text, tables, OCR for scanned PDFs. Free, fast.
-python pdf2md.py "/path/to/Zotero/storage" --jobs 4
+# A1 — Local conversion: text + tables + OCR for scanned pages.
+python pdf2md.py ROOT --jobs 4
 
-# 2. Triage + figure enrichment in one batch submission.
-python pdf2md.py "/path/to/Zotero/storage" \
-    --triage --enrich-figures --fallback batches \
+# B0 — Dry-run cost / time estimate for figure enrichment.
+python pdf2md.py ROOT --enrich-figures --enrich-dry-run \
     --enrich-min-image-pixels 30 30 --enrich-max-images-per-pdf 50
 
-# 3. When the batch finishes (typically <1 h, max 24 h):
-python pdf2md.py "/path/to/Zotero/storage" --resume-batch
-```
+# B1 — 🌐 Submit an enrichment batch (50% cheaper, ~1 h turnaround).
+python pdf2md.py ROOT --enrich-figures --fallback batches \
+    --enrich-min-image-pixels 30 30 --enrich-max-images-per-pdf 50
 
-### Path B: Claude Code CLI (Pro/Max subscription, runs overnight)
+# B2 — 🌐 Pull batch results once the batch finishes.
+python pdf2md.py ROOT --resume-batch
 
-```bash
-# 1. Same first step as above.
-python pdf2md.py "/path/to/Zotero/storage" --jobs 4
+# C1 — 🌐 Triage existing .md files, send broken ones for full Claude re-conversion.
+python pdf2md.py ROOT --triage-only --fallback batches
 
-# 2. Synchronous per-image, with overnight-safe quota handling.
-python pdf2md.py "/path/to/Zotero/storage" \
-    --triage --enrich-figures --fallback claude-cli \
+# D1 — Local repair: turn dead image refs back into retriable placeholders.
+python pdf2md.py ROOT --enrich-restore-broken
+
+# E1 — 🌐 Overnight-safe per-image enrichment via Claude Pro/Max.
+python pdf2md.py ROOT --enrich-figures --fallback claude-cli \
     --enrich-min-image-pixels 30 30 --enrich-max-images-per-pdf 50 \
     --enrich-rate-limit-wait 3600 --enrich-max-wait 14400
+
+# F1 — Local triage audit (cached between runs).
+python pdf2md.py ROOT --triage-only
 ```
 
-`--enrich-rate-limit-wait` and `--enrich-max-wait` are the overnight-safe knobs ([§7.2](#72-overnight-safe-quota-handling)) — when quota fires, the script sleeps and retries automatically, capped by `--enrich-max-wait` total seconds slept.
+`--enrich-rate-limit-wait` and `--enrich-max-wait` make the CLI run safe to start before bed: when quota fires, the script sleeps until reset and retries the same image automatically, capped by `--enrich-max-wait` total seconds. See [§7.2](#72-overnight-safe-quota-handling).
 
 ### Always preview cost first
 
 ```bash
-python pdf2md.py "/path/to/Zotero/storage" --enrich-figures --enrich-dry-run \
+python pdf2md.py ROOT --enrich-figures --enrich-dry-run \
     --enrich-min-image-pixels 30 30 --enrich-max-images-per-pdf 50
 ```
 
@@ -166,7 +186,7 @@ Tune with `--ocr-dpi` (default 150) and `--ocr-lang` (default `eng`; e.g. `eng+d
 
 ### 6.3 Triage
 
-Triage flags PDFs where pymupdf4llm's text extraction clearly failed, so the Claude fallback is only spent where it adds value.
+Triage is a **local-only** audit (no Claude calls) that flags PDFs where pymupdf4llm's text extraction clearly failed, so the 🌐 Claude fallback is only spent where it adds value. Results are cached at `<project>/state/triage_cache_<libhash>.json` keyed on PDF + `.md` mtimes — re-runs after adding a new paper finish in seconds because the unchanged majority is a cache hit. Pass `--no-triage-cache` to force a fresh scan.
 
 | Reason | Hard trigger? |
 |---|---|
@@ -184,7 +204,9 @@ python pdf2md.py /path/to/storage --triage
 python pdf2md.py /path/to/storage --triage-only
 ```
 
-### 6.4 Full-PDF fallback for flagged PDFs
+### 6.4 🌐 Full-PDF fallback for flagged PDFs
+
+All four transports below are online (Claude calls).
 
 | Mode | What happens | Needs |
 |---|---|---|
@@ -212,7 +234,9 @@ python pdf2md.py /path/to/storage --triage-only --fallback command
 
 ---
 
-## 7. Figure enrichment
+## 7. 🌐 Figure enrichment
+
+The actual `--enrich-figures` call is online (sends each image to Claude). Filters, dry-run, and recovery (§7.1, §7.3) are local.
 
 Scientific PDFs often embed tables, formulas, and chart panels as raster images instead of text. pymupdf4llm emits a placeholder for those:
 
@@ -269,7 +293,7 @@ python pdf2md.py "/path/to/storage" --resume-batch
 
 Pair `--enrich-dry-run` with `--fallback claude-cli` or `--fallback api` to also sample 5 PDFs for a real wallclock estimate (`~5h 30m - 8h 10m`), drawn from your actual library.
 
-### 7.2 Overnight-safe quota handling
+### 7.2 🌐 Overnight-safe quota handling
 
 The figure-enrichment loop is designed to survive Claude's 5-hour rolling rate windows without manual intervention. When a rate-limit / quota error fires inside the per-image loop:
 
@@ -314,57 +338,60 @@ The `[unknown]` token escapes `--enrich-min-image-pixels` (we lost the original 
 
 ## 8. Options reference
 
+The **Type** column distinguishes flags that run entirely on your machine (`local`) from flags that call Claude or hit Anthropic's API (`online`, marked 🌐).
+
 ### Conversion
 
-| Flag | Default | Effect |
-|---|---|---|
-| `--force` | off | Re-convert even if `.md` already exists |
-| `--jobs N` | `1` | Parallel worker processes for conversion |
-| `--ocr {auto,always,never}` | `auto` | pymupdf4llm OCR mode |
-| `--ocr-dpi N` | `150` | OCR rasterization DPI |
-| `--ocr-lang LANG` | `eng` | Tesseract language (e.g. `eng+deu`) |
+| Flag | Default | Type | Effect |
+|---|---|---|---|
+| `--force` | off | local | Re-convert even if `.md` already exists |
+| `--jobs N` | `1` | local | Parallel worker processes for conversion |
+| `--ocr {auto,always,never}` | `auto` | local | pymupdf4llm OCR mode |
+| `--ocr-dpi N` | `150` | local | OCR rasterization DPI |
+| `--ocr-lang LANG` | `eng` | local | Tesseract language (e.g. `eng+deu`) |
 
 ### Triage
 
-| Flag | Default | Effect |
-|---|---|---|
-| `--triage` | off | Flag PDFs after each conversion |
-| `--triage-only` | off | Triage existing `.md` files, no re-extraction |
-| `--min-chars-per-page N` | `100` | Below this chars/page, output is "minimal" |
+| Flag | Default | Type | Effect |
+|---|---|---|---|
+| `--triage` | off | local | Flag PDFs after each conversion (uses cache) |
+| `--triage-only` | off | local | Triage existing `.md` files, no re-extraction |
+| `--min-chars-per-page N` | `100` | local | Below this chars/page, output is "minimal" |
+| `--no-triage-cache` | off | local | Force a fresh triage scan; bypass cache |
 
 ### Fallback transports
 
-| Flag | Default | Effect |
-|---|---|---|
-| `--fallback {api,claude-cli,command,batches,none}` | `none` | How to handle flagged PDFs / enrichment images |
-| `--api-model MODEL` | `claude-sonnet-4-6` | Model for `api` / `batches` |
-| `--cli-model MODEL` | `claude-sonnet-4-6` | Model for `claude-cli` / `command` |
-| `--claude-bin PATH` | auto-detect | Explicit path to `claude.exe` / `claude.cmd` |
-| `--command-file PATH` | `<root>/pdf2md_triage_commands.txt` | Where `--fallback command` writes |
-| `--state-dir DIR` | `<project>/state` | Where batch state JSON files live |
-| `--resume-batch` | — | Poll the last submitted batch and write back |
+| Flag | Default | Type | Effect |
+|---|---|---|---|
+| `--fallback {api,claude-cli,command,batches,none}` | `none` | 🌐 online | How to handle flagged PDFs / enrichment images (`none` and `command` are local) |
+| `--api-model MODEL` | `claude-sonnet-4-6` | 🌐 online | Model for `api` / `batches` |
+| `--cli-model MODEL` | `claude-sonnet-4-6` | 🌐 online | Model for `claude-cli` / `command` |
+| `--claude-bin PATH` | auto-detect | local | Explicit path to `claude.exe` / `claude.cmd` |
+| `--command-file PATH` | `<project>/output/pdf2md_triage_commands_<libhash>.txt` | local | Where `--fallback command` writes |
+| `--state-dir DIR` | `<project>/state` | local | Where batch state and triage cache JSONs live |
+| `--resume-batch` | — | 🌐 online | Poll the last submitted batch and write back |
 
 ### Enrichment
 
-| Flag | Default | Effect |
-|---|---|---|
-| `--enrich-figures` | off | Transcribe embedded images via Claude (requires `--fallback` or `--enrich-dry-run`) |
-| `--enrich-max-images-per-pdf N` | `0` (off) | Skip PDFs with more than N placeholders |
-| `--enrich-min-image-pixels W H` | `0 0` (off) | Drop placeholders smaller than W × H |
-| `--enrich-skip-pdfs FILE` | none | Plain-text file of path-substrings to skip |
-| `--enrich-dry-run` | off | Count + estimate cost; no API calls |
-| `--enrich-keep-images` | off | Preserve image files; append `*Source figure:*` footer |
-| `--enrich-restore-broken` | — | Convert dead image refs back to `[unknown]` placeholders |
-| `--enrich-rate-limit-wait SECONDS` | `3600` | Default sleep when no `retry-after` is parseable |
-| `--enrich-max-wait SECONDS` | `14400` | Cap on total seconds slept across the run |
-| `--enrich-quota-threshold PCT` | `0` (off) | Pre-emptive sleep at this % usage (API only) |
-| `--enrich-pace-aware` | off | Adaptive pacing on top of the threshold (API only) |
+| Flag | Default | Type | Effect |
+|---|---|---|---|
+| `--enrich-figures` | off | 🌐 online | Transcribe embedded images via Claude (requires `--fallback` or `--enrich-dry-run`) |
+| `--enrich-max-images-per-pdf N` | `0` (off) | local | Skip PDFs with more than N placeholders |
+| `--enrich-min-image-pixels W H` | `0 0` (off) | local | Drop placeholders smaller than W × H |
+| `--enrich-skip-pdfs FILE` | none | local | Plain-text file of path-substrings to skip |
+| `--enrich-dry-run` | off | local | Count + estimate cost; no API calls |
+| `--enrich-keep-images` | off | local | Preserve image files; append `*Source figure:*` footer |
+| `--enrich-restore-broken` | — | local | Convert dead image refs back to `[unknown]` placeholders |
+| `--enrich-rate-limit-wait SECONDS` | `3600` | 🌐 online | Default sleep when no `retry-after` is parseable |
+| `--enrich-max-wait SECONDS` | `14400` | 🌐 online | Cap on total seconds slept across the run |
+| `--enrich-quota-threshold PCT` | `0` (off) | 🌐 online | Pre-emptive sleep at this % usage (API only) |
+| `--enrich-pace-aware` | off | 🌐 online | Adaptive pacing on top of the threshold (API only) |
 
 ### Misc
 
-| Flag | Effect |
-|---|---|
-| `--check` | Verify Tesseract, Claude CLI, and `anthropic` package are available, then exit |
+| Flag | Type | Effect |
+|---|---|---|
+| `--check` | local | Print local-vs-online dependency report, then exit |
 
 ---
 
@@ -378,9 +405,12 @@ pdf2md4llm/
 ├── requirements-dev.txt   # adds pytest
 ├── pyproject.toml         # uv / pip-friendly project metadata
 └── tests/
-    ├── test_enrich_slots.py    # the load-bearing regression test for the bug fix
-    ├── test_quota.py           # quota / rate-limit detection + retry-after parsing
-    └── test_recovery.py        # --enrich-restore-broken behavior
+    ├── test_enrich_slots.py        # load-bearing regression for the slot-rebuild bug fix
+    ├── test_quota.py               # quota / rate-limit detection + retry-after parsing
+    ├── test_recovery.py            # --enrich-restore-broken behavior
+    ├── test_triage_cache.py        # triage cache key + load/save round-trip + hit-skips-PDF
+    ├── test_validation.py          # _validate_args: error/warn for bad flag combinations
+    └── test_pass_b_ordering.py     # cap-skip pre-check uses .md only, never opens PDF
 ```
 
 Run the tests:

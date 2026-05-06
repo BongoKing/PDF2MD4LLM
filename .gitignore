@@ -2,6 +2,11 @@
 storage/
 local_python_cmd.txt
 
+# Per-library state generated at runtime (batch state JSON, triage cache,
+# emitted command files). Never source — always regenerable.
+state/
+output/
+
 # Python
 __pycache__/
 *.py[cod]

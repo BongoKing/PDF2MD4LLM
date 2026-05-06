@@ -114,6 +114,19 @@ _FILENAME_SAFE_RE = re.compile(r"[^\w.\- ]")
 _COST_PER_IMAGE_LOW = 0.005
 _COST_PER_IMAGE_HIGH = 0.01
 
+# Pending sentinel format used by batches / command mode to mark a slot
+# that will be resolved later. Kept as a valid IMAGE_REF so existing
+# tooling treats it consistently; the recovery pass detects it via the
+# pdf2md-pending- filename prefix.
+SENTINEL_PREFIX = "pdf2md-pending-"
+
+_FILENAME_SAFE_RE = re.compile(r"[^\w.\- ]")
+
+# Rough Sonnet 4.6 vision cost range per image (batches discount applied).
+# Used only by --enrich-dry-run to print a price estimate.
+_COST_PER_IMAGE_LOW = 0.005
+_COST_PER_IMAGE_HIGH = 0.01
+
 IMAGE_DESCRIBE_PROMPT = (
     "You are viewing an image extracted from a scientific PDF. "
     "Produce the best Markdown representation of its content:\n"
@@ -156,6 +169,26 @@ def triage_command_path(root: Path, output_dir: Path) -> Path:
     return output_dir / f"pdf2md_triage_commands_{library_hash(root)}.txt"
 
 
+def triage_cache_path(root: Path, state_dir: Path) -> Path:
+    return state_dir / f"triage_cache_{library_hash(root)}.json"
+
+
+# Flags whose effect requires an LLM call or the Anthropic API.
+# The set drives --check output, --help tagging, and validation messages
+# so the local-vs-online distinction has a single source of truth.
+ONLINE_FLAGS: frozenset[str] = frozenset({
+    "fallback",
+    "api_model",
+    "cli_model",
+    "resume_batch",
+    "enrich_figures",
+    "enrich_rate_limit_wait",
+    "enrich_max_wait",
+    "enrich_quota_threshold",
+    "enrich_pace_aware",
+})
+
+
 # === Tesseract OCR preflight ===
 
 TESSERACT_INSTALL_HINT = """
@@ -186,7 +219,49 @@ def preflight_tesseract() -> str:
 
 # === Triage ===
 # Detect PDFs whose pymupdf4llm output is unusable so the Claude full-PDF
-# fallback is only spent where it adds value.
+# fallback is only spent where it adds value. The triage cache persists
+# results across runs so adding a single new paper to the library doesn't
+# trigger a full re-scan.
+
+def triage_cache_key(pdf_path: Path, md_path: Path,
+                     min_chars_per_page: int) -> str:
+    """Return a stable hash of all inputs that influence triage's verdict.
+
+    A change in any of these invalidates the cache entry:
+    - PDF path / mtime / size  (PDF content)
+    - .md mtime or "missing"   (extraction result)
+    - min_chars_per_page       (the threshold itself)
+    """
+    try:
+        pdf_stat = pdf_path.stat()
+        pdf_part = f"{pdf_path.resolve()}|{pdf_stat.st_mtime_ns}|{pdf_stat.st_size}"
+    except OSError:
+        pdf_part = f"{pdf_path}|missing"
+    if md_path.exists():
+        md_part = f"{md_path.stat().st_mtime_ns}"
+    else:
+        md_part = "missing"
+    raw = f"{pdf_part}|{md_part}|{min_chars_per_page}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def load_triage_cache(path: Path) -> dict:
+    """Read the on-disk cache; tolerant of a missing or corrupt file."""
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_triage_cache(path: Path, cache: dict) -> None:
+    """Write the cache with an atomic rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
 
 def analyze_pdf(pdf_path: Path) -> dict:
     """Inspect a PDF for math-font presence. pymupdf4llm itself handles
@@ -215,7 +290,8 @@ def md_has_math_markup(md_text: str) -> bool:
 
 
 def triage(pdf_path: Path, md_path: Path,
-           min_chars_per_page: int) -> tuple[list[str], bool]:
+           min_chars_per_page: int,
+           cache: dict | None = None) -> tuple[list[str], bool]:
     """Return (reasons, should_fallback).
 
     Hard triggers (should_fallback=True):
@@ -224,13 +300,26 @@ def triage(pdf_path: Path, md_path: Path,
 
     Informational (no fallback):
       - math-fonts-present-but-captured
+
+    If `cache` is supplied, the result is looked up by a key built from
+    the PDF + .md mtimes/sizes and the threshold. Hits return immediately;
+    misses fill the cache in-place (caller persists it once at end of run).
     """
+    cache_key = None
+    if cache is not None:
+        cache_key = triage_cache_key(pdf_path, md_path, min_chars_per_page)
+        hit = cache.get(cache_key)
+        if hit is not None:
+            return list(hit["reasons"]), bool(hit["should_fallback"])
+
     reasons: list[str] = []
     should_fallback = False
 
     pdf_info = analyze_pdf(pdf_path)
     if pdf_info["error"]:
         reasons.append(f"pdf-read-error: {pdf_info['error']}")
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = {"reasons": reasons, "should_fallback": False}
         return reasons, False
 
     pages = max(pdf_info["pages"], 1)
@@ -257,6 +346,8 @@ def triage(pdf_path: Path, md_path: Path,
             reasons.append(f"math-fonts-dropped ({sample})")
             should_fallback = True
 
+    if cache is not None and cache_key is not None:
+        cache[cache_key] = {"reasons": reasons, "should_fallback": should_fallback}
     return reasons, should_fallback
 
 
@@ -1615,42 +1706,124 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                              "(default: <project>/state/)")
     parser.add_argument("--resume-batch", action="store_true",
                         help="Poll the last submitted batch and write results (no conversion/triage)")
+    parser.add_argument("--no-triage-cache", action="store_true",
+                        help="Force a fresh triage scan; bypass the per-library cache.")
     parser.add_argument("--check", action="store_true",
                         help="Verify dependencies (Tesseract, claude CLI, anthropic) and exit")
+
+    # Tag online-only flags in the help text so `--help` users see the
+    # local-vs-online split at a glance.
+    for action in parser._actions:
+        if not action.help or action.help.startswith("[ONLINE]"):
+            continue
+        attr = action.dest
+        if attr in ONLINE_FLAGS:
+            action.help = "[ONLINE] " + action.help
     return parser
+
+
+# === Validation ===
+# Catch flag combinations that are silently ignored or contradictory in the
+# current code and either error out or warn so the user knows their command
+# was understood as written.
+
+def _validate_args(args: argparse.Namespace) -> None:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # Standalone-only modes that should not be paired with processing flags.
+    processing_flags_set = (
+        args.force or args.jobs > 1 or args.triage or args.triage_only
+        or args.enrich_figures or args.enrich_dry_run
+    )
+    if args.resume_batch and processing_flags_set:
+        errors.append(
+            "--resume-batch runs alone (no conversion / triage / enrichment). "
+            "Re-run with only --resume-batch and --root_dir.")
+    if args.enrich_restore_broken and processing_flags_set:
+        errors.append(
+            "--enrich-restore-broken is a recovery-only mode. "
+            "Re-run with only --enrich-restore-broken and --root_dir, then "
+            "re-run --enrich-figures separately.")
+    if args.resume_batch and args.enrich_restore_broken:
+        errors.append(
+            "Pick one of --resume-batch / --enrich-restore-broken; both "
+            "short-circuit the run independently.")
+
+    # Models that don't apply to the chosen transport.
+    if args.api_model != "claude-sonnet-4-6" and args.fallback in (
+            "claude-cli", "command", "none"):
+        warnings.append(
+            f"--api-model is ignored with --fallback {args.fallback} "
+            f"(applies to api / batches only).")
+    if args.cli_model != "claude-sonnet-4-6" and args.fallback in (
+            "api", "batches", "none"):
+        warnings.append(
+            f"--cli-model is ignored with --fallback {args.fallback} "
+            f"(applies to claude-cli / command only).")
+
+    # --triage-only is conversion-skipping; conversion-side flags don't apply.
+    if args.triage_only and args.force:
+        warnings.append("--force has no effect with --triage-only (no conversion runs).")
+    if args.triage_only and args.jobs > 1:
+        warnings.append("--jobs has no effect with --triage-only (no conversion runs).")
+
+    # --enrich-quota-threshold range check (kept for completeness).
+    if args.enrich_quota_threshold and (
+            args.enrich_quota_threshold < 1 or args.enrich_quota_threshold > 99):
+        errors.append("--enrich-quota-threshold must be 1-99 (or 0 to disable).")
+
+    # Surfaced as warnings, not errors.
+    for line in warnings:
+        print(f"Warning: {line}")
+    if errors:
+        for line in errors:
+            print(f"Error: {line}")
+        sys.exit(2)
 
 
 def _run_check() -> None:
     print("Checking dependencies...\n")
-    print("For local extraction (pymupdf4llm OCR — scanned PDFs):")
+    print("=== Local-only capabilities (work offline) ===")
+    print("These cover conversion, OCR, triage, enrichment filters, "
+          "dry-runs, and recovery.")
     tess = shutil.which("tesseract")
     if tess:
-        print(f"  [OK]   Tesseract: {tess}")
+        print(f"  [OK]   Tesseract OCR             : {tess}")
     else:
-        print("  [MISS] Tesseract not on PATH. Install:")
-        for line in TESSERACT_INSTALL_HINT.splitlines():
-            print(f"         {line}")
+        print("  [MISS] Tesseract OCR             : not on PATH "
+              "(scanned PDFs will produce empty .md files)")
+    try:
+        import pymupdf4llm  # noqa: F401
+        print("  [OK]   pymupdf4llm package       : installed")
+    except ImportError:
+        print("  [MISS] pymupdf4llm package       : missing  "
+              "(pip install -r requirements.txt)")
 
-    print("\nFor --fallback claude-cli  (uses your Claude Max subscription):")
+    print("\n=== Online capabilities (need internet + Claude access) ===")
+    print("Required only if you use --fallback {api,batches,claude-cli} "
+          "or --enrich-figures.")
+    print("\nFor --fallback claude-cli  (uses your Claude Pro / Max subscription):")
     try:
         resolved = resolve_claude_executable(verify=True)
-        print(f"  [OK]   Claude Code CLI: {resolved}")
+        print(f"  [OK]   Claude Code CLI           : {resolved}")
     except RuntimeError as exc:
-        print("  [MISS] Claude Code CLI not available.")
+        print("  [MISS] Claude Code CLI           : not available")
         for line in str(exc).splitlines():
             print(f"         {line}")
 
     print("\nFor --fallback api / batches  (uses Anthropic API, billed per token):")
     try:
         import anthropic  # noqa: F401
-        print("  [OK]   anthropic package installed")
+        print("  [OK]   anthropic package         : installed")
     except ImportError:
-        print("  [MISS] anthropic package not installed. Install: pip install anthropic")
+        print("  [MISS] anthropic package         : missing  "
+              "(pip install anthropic)")
     if os.environ.get("ANTHROPIC_API_KEY"):
-        print("  [OK]   ANTHROPIC_API_KEY is set")
+        print("  [OK]   ANTHROPIC_API_KEY         : set")
     else:
-        print("  [n/a]  ANTHROPIC_API_KEY not set "
-              "(only required if you use --fallback api or batches)")
+        print("  [n/a]  ANTHROPIC_API_KEY         : not set "
+              "(needed only for --fallback api / batches)")
 
 
 def main() -> None:
@@ -1680,10 +1853,8 @@ def main() -> None:
         print("Error: --enrich-figures requires --fallback (api | claude-cli | batches | command), "
               "or pair with --enrich-dry-run for an estimate-only run.")
         sys.exit(1)
-    if args.enrich_quota_threshold and (
-            args.enrich_quota_threshold < 1 or args.enrich_quota_threshold > 99):
-        print("Error: --enrich-quota-threshold must be between 1 and 99 (or 0 to disable).")
-        sys.exit(1)
+
+    _validate_args(args)
 
     root = Path(args.root_dir) if args.root_dir else None
     if root is None or not root.is_dir():
@@ -1780,6 +1951,18 @@ def main() -> None:
         rate_limit_wait_seconds=float(args.enrich_rate_limit_wait),
     )
 
+    # Triage cache — loaded lazily, persisted once at end of Pass B.
+    triage_cache: dict | None = None
+    triage_cache_file: Path | None = None
+    if (args.triage or args.triage_only) and not args.no_triage_cache:
+        triage_cache_file = triage_cache_path(root, state_dir)
+        triage_cache = load_triage_cache(triage_cache_file)
+        if triage_cache:
+            print(f"Triage cache: {len(triage_cache)} entries loaded from "
+                  f"{triage_cache_file}")
+        else:
+            print(f"Triage cache: empty (will populate {triage_cache_file})")
+
     success = skipped = failed = flagged = fallback_ok = fallback_fail = 0
     enrich_mds = enrich_imgs = enrich_fail = 0
     enrich_pdfs_skipped = enrich_imgs_dropped = 0
@@ -1838,6 +2021,10 @@ def main() -> None:
 
         # Pass B: triage / fallback / enrich
         if args.triage or args.triage_only or args.enrich_figures:
+            cap = enrich_filters.get("max_per_pdf") or 0
+            skip_substrings = enrich_filters.get("skip_substrings") or []
+            triage_requested = args.triage or args.triage_only
+
             for i, pdf_path in enumerate(pdf_files, 1):
                 md_path = pdf_path.with_suffix(".md")
                 progress_tag = f"[{i}/{len(pdf_files)}]"
@@ -1845,9 +2032,36 @@ def main() -> None:
                 if str(pdf_path) in convert_failures:
                     continue
 
-                if args.triage or args.triage_only:
+                # Cheap pre-check: decide whether enrichment will skip this PDF
+                # entirely. Reading the .md and counting placeholders is ~5 ms;
+                # opening the PDF for triage is ~500 ms. If we know enrichment
+                # will skip and the user didn't ask for triage, the whole PDF
+                # is fast-path-skipped here without any pymupdf I/O.
+                enrich_skip_reason: str | None = None
+                if args.enrich_figures and md_path.exists():
+                    if _matches_skip_list(pdf_path, skip_substrings):
+                        enrich_skip_reason = "skip-list"
+                    elif cap > 0:
+                        try:
+                            md_for_check = md_path.read_text(
+                                encoding="utf-8", errors="ignore")
+                            placeholder_count = sum(
+                                1 for _ in PLACEHOLDER_RE.finditer(md_for_check))
+                            if placeholder_count > cap:
+                                enrich_skip_reason = "cap-exceeded"
+                        except Exception:
+                            pass  # fall through to normal enrichment path
+
+                if enrich_skip_reason and not triage_requested:
+                    enrich_pdfs_skipped += 1
+                    print(f"{progress_tag} SKIP-ENRICH "
+                          f"({enrich_skip_reason}): {pdf_path.name}")
+                    continue
+
+                if triage_requested:
                     reasons, should_fallback = triage(
-                        pdf_path, md_path, args.min_chars_per_page)
+                        pdf_path, md_path, args.min_chars_per_page,
+                        cache=triage_cache)
                     if reasons:
                         flagged_report.append((pdf_path, reasons, should_fallback))
                     if should_fallback:
@@ -1868,7 +2082,8 @@ def main() -> None:
                                 fallback_fail += 1
                                 continue
 
-                if args.enrich_figures and md_path.exists():
+                if (args.enrich_figures and md_path.exists()
+                        and enrich_skip_reason is None):
                     try:
                         processed, failed_imgs, dropped, skip_reason = (
                             enrich_figures_for_pdf(
@@ -1905,9 +2120,23 @@ def main() -> None:
                     except Exception as exc:
                         print(f"    ENRICH ERROR on {pdf_path.name}: {exc}")
                         enrich_fail += 1
+                elif (args.enrich_figures and md_path.exists()
+                        and enrich_skip_reason is not None):
+                    # Pre-check determined we'd skip; report it now that triage
+                    # (if requested) has run. Avoids the redundant function call.
+                    enrich_pdfs_skipped += 1
+                    print(f"{progress_tag} SKIP-ENRICH "
+                          f"({enrich_skip_reason}): {pdf_path.name}")
     finally:
         if command_sink is not None:
             command_sink.close()
+        if triage_cache is not None and triage_cache_file is not None:
+            try:
+                save_triage_cache(triage_cache_file, triage_cache)
+                print(f"Triage cache saved: {len(triage_cache)} entries -> "
+                      f"{triage_cache_file}")
+            except Exception as exc:
+                print(f"Warning: could not save triage cache: {exc}")
 
     if args.fallback == "batches":
         submit_batch(batch_state, root, state_dir)
