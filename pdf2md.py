@@ -127,6 +127,19 @@ _FILENAME_SAFE_RE = re.compile(r"[^\w.\- ]")
 _COST_PER_IMAGE_LOW = 0.005
 _COST_PER_IMAGE_HIGH = 0.01
 
+# Pending sentinel format used by batches / command mode to mark a slot
+# that will be resolved later. Kept as a valid IMAGE_REF so existing
+# tooling treats it consistently; the recovery pass detects it via the
+# pdf2md-pending- filename prefix.
+SENTINEL_PREFIX = "pdf2md-pending-"
+
+_FILENAME_SAFE_RE = re.compile(r"[^\w.\- ]")
+
+# Rough Sonnet 4.6 vision cost range per image (batches discount applied).
+# Used only by --enrich-dry-run to print a price estimate.
+_COST_PER_IMAGE_LOW = 0.005
+_COST_PER_IMAGE_HIGH = 0.01
+
 IMAGE_DESCRIBE_PROMPT = (
     "You are viewing an image extracted from a scientific PDF. "
     "Produce the best Markdown representation of its content:\n"
